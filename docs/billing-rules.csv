@@ -1,0 +1,14 @@
+计量项,单位,免费版配额,专业版配额,企业版配额,超限时行为,配置项
+shop.count,个,3,100,不限,返回 402 quota_exceeded 并引导升级,plan.max_shops
+device.count,台,1,200,不限,返回 402 quota_exceeded,plan.max_devices
+member.count,人,3,50,不限,返回 402 quota_exceeded（成员本身不收席位费）,plan.max_members
+api.call,次/日,1000,100000,不限,限流 429 + 计量告警,api.rate_per_minute / api.daily_quota_free
+ai.credit,积分,0,按套餐,按套餐,返回 402 entitlement_required（功能开关）,plan.has_agent
+storage.bytes,GB·月,按录像保留期,30 天,180 天,到期删除 + 密钥销毁,replay.retention_days_free
+recording.retention,天,7,30,180,到期清理（免费版保留期短）,plan.recording_retention_days
+feature:agent,开关,N,Y,Y,返回 402 entitlement_required,plan.has_agent
+feature:forensic_export,开关,N,Y,Y,返回 402 entitlement_required,plan.has_forensic_export
+feature:custom_plugin,开关,N,N,Y,返回 402 entitlement_required,plan.has_custom_plugin
+
+单价锚点,设备订阅,68 元/设备/月（规格锚定值，配置中心可调）,,,"plan.pro.price_per_device_per_month=6800 分"
+未决事项,AI 积分单价 / 录像存储单价 / 云号并发单价,待产品定价后写入配置中心，禁止散落在代码（L10）

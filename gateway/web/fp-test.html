@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<!--
+  指纹实测页：用于在「环境窗口」里肉眼验证注入是否生效。
+  打开方式：控制台 → 店铺管理 → 启动环境，窗口会直接进到本页。
+  对比方法：开两个不同店铺的环境，两边的 UA / 时区 / Canvas 哈希 / WebGL
+  应当互不相同；同一环境反复开关则应完全一致（确定性，不是随机）。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>指纹实测 · 紫鸟浏览器</title>
+  <style>
+    body { margin: 0; background: #0b0f1a; color: #e8edf8; font: 14px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { padding: 14px 22px; background: linear-gradient(90deg, #16203a, #101728); border-bottom: 1px solid #26304a; }
+    header h1 { margin: 0; font-size: 16px; }
+    header p { margin: 4px 0 0; color: #8d9ab8; font-size: 12px; }
+    main { padding: 18px 22px; }
+    table { border-collapse: collapse; width: 100%; max-width: 900px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #26304a; vertical-align: top; }
+    th { width: 200px; color: #8d9ab8; font-weight: 500; }
+    td { font-family: Consolas, monospace; word-break: break-all; }
+    .tag { display: inline-block; padding: 1px 9px; border-radius: 20px; font-size: 12px; margin-left: 8px; }
+    .ok { background: rgba(52,211,153,.14); color: #34d399; border: 1px solid rgba(52,211,153,.35); }
+    .warn { background: rgba(251,191,36,.14); color: #fbbf24; border: 1px solid rgba(251,191,36,.35); }
+    canvas { display: block; margin-top: 10px; border: 1px solid #26304a; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>指纹实测 <span id="injectTag" class="tag warn">未检测到注入</span></h1>
+    <p>本页只读不解算服务端数据；开两个不同环境对比，数值应互不相同；同一环境反复开关应完全一致。</p>
+  </header>
+  <main>
+    <table>
+      <tr><th>User-Agent</th><td id="ua"></td></tr>
+      <tr><th>Platform</th><td id="platform"></td></tr>
+      <tr><th>语言 / Locale</th><td id="lang"></td></tr>
+      <tr><th>时区</th><td id="tz"></td></tr>
+      <tr><th>屏幕 / DPR / 色深</th><td id="screen"></td></tr>
+      <tr><th>CPU 核数 / 内存</th><td id="cpu"></td></tr>
+      <tr><th>WebGL 厂商 / 渲染器</th><td id="webgl"></td></tr>
+      <tr><th>Canvas 哈希</th><td id="canvas"></td></tr>
+      <tr><th>Audio 指纹</th><td id="audio"></td></tr>
+      <tr><th>自动化痕迹 webdriver</th><td id="auto"></td></tr>
+      <tr><th>基线哈希 baseline</th><td id="base"></td></tr>
+    </table>
+    <canvas id="cv" width="260" height="60"></canvas>
+    <p class="muted" style="color:#8d9ab8">上方画布同样参与指纹采样（注入会扰动其输出）。</p>
+  </main>
+
+  <script>
+    function txt(nav) { return nav === undefined || nav === null ? '—' : String(nav); }
+    function hash(s) { var h = 2166136261; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; } return (h >>> 0).toString(16); }
+    function set(id, fn) { try { document.getElementById(id).textContent = fn(); } catch (e) { document.getElementById(id).textContent = '取值异常: ' + e.message; } }
+
+    var nav = navigator;
+    set('ua', function () { return txt(nav.userAgent); });
+    set('platform', function () { return txt(nav.platform); });
+    set('lang', function () { return txt(nav.language) + ' / ' + txt(nav.languages ? nav.languages.join(',') : ''); });
+    set('tz', function () {
+      return txt(Intl.DateTimeFormat().resolvedOptions().timeZone) +
+        ' (UTC' + (new Date().getTimezoneOffset() > 0 ? '-' : '+') + Math.abs(new Date().getTimezoneOffset() / 60) + ')';
+    });
+    set('screen', function () { return screen.width + 'x' + screen.height + ' / dpr=' + window.devicePixelRatio + ' / depth=' + screen.colorDepth; });
+    set('cpu', function () { return txt(nav.hardwareConcurrency) + ' 核 / ' + txt(nav.deviceMemory) + ' GB'; });
+    set('webgl', function () {
+      var gl = document.createElement('canvas').getContext('webgl');
+      var dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      return dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) + ' / ' + gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'WebGL 不可用';
+    });
+
+    // Canvas 采样
+    try {
+      var cv = document.getElementById('cv');
+      var ctx = cv.getContext('2d');
+      ctx.fillStyle = '#4d7fff'; ctx.fillRect(0, 0, 260, 60);
+      ctx.font = '18px "Segoe UI"'; ctx.fillStyle = '#fff';
+      ctx.fillText('紫鸟 finger-print.13', 12, 36);
+      set('canvas', function () { return hash(cv.toDataURL()); });
+    } catch (e) { document.getElementById('canvas').textContent = '取值异常: ' + e.message; }
+
+    set('audio', function () {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      var ac = new AC();
+      var comp = ac.createDynamicsCompressor();
+      return 'reduction=' + (comp.reduction ? comp.reduction.value : 'n/a');
+    });
+    set('auto', function () {
+      return (nav.webdriver === undefined || nav.webdriver === false) ? '无（正常）' : '存在（异常！应已被抹除）';
+    });
+    set('base', function () {
+      var base = window.__ZINIAO_BASELINE__ || window.__ZINIAO_INJECT_BASELINE__;
+      return base || '未检测到注入运行时';
+    });
+    if (window.__ZINIAO_BASELINE__) {
+      var tag = document.getElementById('injectTag');
+      tag.textContent = '注入已生效';
+      tag.className = 'tag ok';
+    }
+  </script>
+</body>
+</html>

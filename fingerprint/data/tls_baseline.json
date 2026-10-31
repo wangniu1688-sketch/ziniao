@@ -1,0 +1,44 @@
+{
+  "_comment": "TLS 指纹基线库。JA3/JA4 为空时由网络层在启动时用 uTLS 真实 ClientHello 计算并回写（RegisterComputed）。hello_id 必须存在于当前 uTLS 版本；uTLS 基线滞后于 Chrome 正式版（v1.6.7 无 HelloChrome_131），故 131 映射 HelloChrome_120_PQ 并标记 fallback，由 shop.CreateEnv 把 UA 的 Chrome 版本一并对齐到 120（否则 UA 说 131、握手是 120，平台交叉比对即可识破）。禁止人工臆造精确数值（L10）。本机实测校准：用真实 Chromium（Edge 87）对本地 raw 探针握手，抓到的 ClientHello 与 uTLS HelloChrome_120 发出的字节在 JA3 四个字段上完全一致（version 771、15 套件、14 扩展、曲线 29-23-24），逐连接差异仅来自随机 GREASE——故「静态构成与真实 Chromium 对齐」可确认；但本机没有真实 Chrome 120/131 可对照，两者对真实的偏差仍标 unverified，需升级 uTLS 或抓真实版本后重新校准（ADR-0006）。",
+  "baselines": [
+    {
+      "chromium_major": 131,
+      "chromium_version": "131.0.6778.86",
+      "hello_id": "HelloChrome_120_PQ",
+      "ja3": "",
+      "ja3_hash": "",
+      "ja4": "",
+      "http2_settings": "1:65536;2:0;3:1000;4:6291456;6:262144",
+      "header_order": [":method", ":authority", ":scheme", ":path", "user-agent", "accept", "accept-encoding", "accept-language"],
+      "alpn": ["h2", "http/1.1"],
+      "source": "fallback",
+      "collected_at": null
+    },
+    {
+      "chromium_major": 120,
+      "chromium_version": "120.0.6099.109",
+      "hello_id": "HelloChrome_120",
+      "ja3": "",
+      "ja3_hash": "",
+      "ja4": "",
+      "http2_settings": "1:65536;2:0;3:1000;4:6291456;6:262144",
+      "header_order": [":method", ":authority", ":scheme", ":path", "user-agent", "accept", "accept-encoding", "accept-language"],
+      "alpn": ["h2", "http/1.1"],
+      "source": "unverified",
+      "collected_at": null
+    },
+    {
+      "chromium_major": 115,
+      "chromium_version": "115.0.5790.170",
+      "hello_id": "HelloChrome_115_PQ",
+      "ja3": "",
+      "ja3_hash": "",
+      "ja4": "",
+      "http2_settings": "1:65536;2:0;3:1000;4:6291456;6:262144",
+      "header_order": [":method", ":authority", ":scheme", ":path", "user-agent", "accept", "accept-encoding", "accept-language"],
+      "alpn": ["h2", "http/1.1"],
+      "source": "unverified",
+      "collected_at": null
+    }
+  ]
+}

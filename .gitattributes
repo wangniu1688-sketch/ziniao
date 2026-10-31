@@ -1,0 +1,13 @@
+# 统一换行符，避免跨环境 diff 噪音
+* text=auto eol=lf
+
+# 批处理必须是 CRLF：cmd.exe 对纯 LF 的 .bat 会把行错位解析成垃圾命令
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制不参与换行转换
+*.png binary
+*.ico binary
+*.exe binary
+*.wasm binary

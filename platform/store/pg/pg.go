@@ -1,0 +1,1117 @@
+// Package pg PostgreSQL 存储驱动（生产）。
+//
+// 多租户策略（L12）：
+//  1. 读写 SQL 一律显式带 tenant_id 谓词；
+//  2. 写路径额外受 RLS WITH CHECK 保护，app.tenant_id 未设置时零行（fail-closed）；
+//  3. 非事务调用（如查询）由驱动自动包一层事务并注入 app.tenant_id。
+package pg
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"ziniao/platform/apierr"
+	"ziniao/platform/store"
+	"ziniao/platform/types"
+)
+
+// querier 统一 pgxpool.Pool 与 pgx.Tx 的共同子集。
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Store PostgreSQL 存储。
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// New 建立连接池并探活。
+func New(ctx context.Context, dsn string) (*Store, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("pg: 连接串解析失败: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("pg: 数据库不可用: %w", err)
+	}
+	return &Store{pool: pool}, nil
+}
+
+// Pool 暴露连接池（供迁移器使用）。
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+func (s *Store) Close() error { s.pool.Close(); return nil }
+
+// WithTx 开事务并注入 RLS 租户变量；提交/回滚由驱动负责。
+func (s *Store) WithTx(ctx context.Context, fn func(store.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if tid, terr := store.TenantFrom(ctx); terr == nil && tid != "" {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tid); err != nil {
+			return err
+		}
+	}
+	if err := fn(txStore{s: s, q: tx}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type txStore struct {
+	s *Store
+	q querier
+}
+
+func (t txStore) Tenants() store.TenantRepo             { return tenantRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Users() store.UserRepo                 { return userRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Credentials() store.CredentialRepo     { return credRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Memberships() store.MembershipRepo     { return memberRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Roles() store.RoleRepo                 { return roleRepo{base{q: t.q, inTx: true}} }
+func (t txStore) UserRoles() store.UserRoleRepo         { return userRoleRepo{base{q: t.q, inTx: true}} }
+func (t txStore) DataGrants() store.DataGrantRepo       { return grantRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Sessions() store.SessionRepo           { return sessionRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Shops() store.ShopRepo                 { return shopRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Subscriptions() store.SubscriptionRepo { return subRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Usage() store.UsageRepo                { return usageRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Outbox() store.OutboxRepo              { return outboxRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Audit() store.AuditRepo                { return auditRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Notifications() store.NotificationRepo { return notifRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Devices() store.DeviceRepo             { return deviceRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Bindings() store.BindingRepo           { return bindingRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Environments() store.EnvironmentRepo   { return envRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Policies() store.AccessPolicyRepo      { return policyRepo{base{q: t.q, inTx: true}} }
+func (t txStore) SecurityEvents() store.SecurityEventRepo {
+	return secEventRepo{base{q: t.q, inTx: true}}
+}
+func (t txStore) Vault() store.VaultRepo        { return vaultRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Approvals() store.ApprovalRepo { return approvalRepo{base{q: t.q, inTx: true}} }
+
+func (s *Store) Tenants() store.TenantRepo               { return tenantRepo{base{st: s, q: s.pool}} }
+func (s *Store) Users() store.UserRepo                   { return userRepo{base{st: s, q: s.pool}} }
+func (s *Store) Credentials() store.CredentialRepo       { return credRepo{base{st: s, q: s.pool}} }
+func (s *Store) Memberships() store.MembershipRepo       { return memberRepo{base{st: s, q: s.pool}} }
+func (s *Store) Roles() store.RoleRepo                   { return roleRepo{base{st: s, q: s.pool}} }
+func (s *Store) UserRoles() store.UserRoleRepo           { return userRoleRepo{base{st: s, q: s.pool}} }
+func (s *Store) DataGrants() store.DataGrantRepo         { return grantRepo{base{st: s, q: s.pool}} }
+func (s *Store) Sessions() store.SessionRepo             { return sessionRepo{base{st: s, q: s.pool}} }
+func (s *Store) Shops() store.ShopRepo                   { return shopRepo{base{st: s, q: s.pool}} }
+func (s *Store) Subscriptions() store.SubscriptionRepo   { return subRepo{base{st: s, q: s.pool}} }
+func (s *Store) Usage() store.UsageRepo                  { return usageRepo{base{st: s, q: s.pool}} }
+func (s *Store) Outbox() store.OutboxRepo                { return outboxRepo{base{st: s, q: s.pool}} }
+func (s *Store) Audit() store.AuditRepo                  { return auditRepo{base{st: s, q: s.pool}} }
+func (s *Store) Notifications() store.NotificationRepo   { return notifRepo{base{st: s, q: s.pool}} }
+func (s *Store) Devices() store.DeviceRepo               { return deviceRepo{base{st: s, q: s.pool}} }
+func (s *Store) Bindings() store.BindingRepo             { return bindingRepo{base{st: s, q: s.pool}} }
+func (s *Store) Environments() store.EnvironmentRepo     { return envRepo{base{st: s, q: s.pool}} }
+func (s *Store) Policies() store.AccessPolicyRepo        { return policyRepo{base{st: s, q: s.pool}} }
+func (s *Store) SecurityEvents() store.SecurityEventRepo { return secEventRepo{base{st: s, q: s.pool}} }
+func (s *Store) Vault() store.VaultRepo                  { return vaultRepo{base{st: s, q: s.pool}} }
+func (s *Store) Approvals() store.ApprovalRepo           { return approvalRepo{base{st: s, q: s.pool}} }
+
+// base 仓库公共能力：事务复用 / 非事务自动包事务。
+type base struct {
+	st   *Store
+	q    querier
+	inTx bool
+}
+
+// run 在正确的执行上下文（事务内）执行 SQL。
+func (b base) run(ctx context.Context, fn func(q querier) error) error {
+	if b.inTx {
+		return fn(b.q)
+	}
+	return b.st.WithTx(ctx, func(tx store.Tx) error {
+		return fn(tx.(txStore).q)
+	})
+}
+
+func (b base) tenant(ctx context.Context) (string, error) { return store.TenantFrom(ctx) }
+
+// ---------- 租户 ----------
+
+type tenantRepo struct{ base }
+
+func (r tenantRepo) Create(ctx context.Context, t *types.Tenant) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO tenants(id,name,slug,status,plan_code,schema_name,created_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7)`,
+			t.ID, t.Name, t.Slug, string(t.Status), t.PlanCode, nullStr(t.SchemaName), t.CreatedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r tenantRepo) Get(ctx context.Context, id string) (*types.Tenant, error) {
+	var out types.Tenant
+	var status string
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,name,slug,status,plan_code,COALESCE(schema_name,''),created_at
+			FROM tenants WHERE id=$1`, id).
+			Scan(&out.ID, &out.Name, &out.Slug, &status, &out.PlanCode, &out.SchemaName, &out.CreatedAt)
+	})
+	out.Status = types.TenantStatus(status)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &out, nil
+}
+
+func (r tenantRepo) GetBySlug(ctx context.Context, slug string) (*types.Tenant, error) {
+	var out types.Tenant
+	var status string
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,name,slug,status,plan_code,COALESCE(schema_name,''),created_at
+			FROM tenants WHERE slug=$1`, slug).
+			Scan(&out.ID, &out.Name, &out.Slug, &status, &out.PlanCode, &out.SchemaName, &out.CreatedAt)
+	})
+	out.Status = types.TenantStatus(status)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &out, nil
+}
+
+func (r tenantRepo) List(ctx context.Context, limit, offset int) ([]types.Tenant, int, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	out := []types.Tenant{}
+	total := 0
+	err := r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&total); err != nil {
+			return err
+		}
+		rows, err := q.Query(ctx, `SELECT id,name,slug,status,plan_code,COALESCE(schema_name,''),created_at
+			FROM tenants ORDER BY created_at LIMIT $1 OFFSET $2`, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t types.Tenant
+			var status string
+			if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &status, &t.PlanCode, &t.SchemaName, &t.CreatedAt); err != nil {
+				return err
+			}
+			t.Status = types.TenantStatus(status)
+			out = append(out, t)
+		}
+		return rows.Err()
+	})
+	return out, total, wrapErr(err)
+}
+
+// ---------- 用户 ----------
+
+type userRepo struct{ base }
+
+func (r userRepo) Create(ctx context.Context, u *types.User) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO users(id,username,email,phone,display_name,status,mfa_enabled,totp_secret,created_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			u.ID, u.Username, nullStr(u.Email), nullStr(u.Phone), nullStr(u.DisplayName),
+			u.Status, u.MFAEnabled, nullStr(u.TOTPSecret), u.CreatedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r userRepo) GetByID(ctx context.Context, id string) (*types.User, error) {
+	out := &types.User{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,username,COALESCE(email,''),COALESCE(phone,''),COALESCE(display_name,''),
+			status,mfa_enabled,COALESCE(totp_secret,''),created_at,last_login_at FROM users WHERE id=$1`, id).
+			Scan(&out.ID, &out.Username, &out.Email, &out.Phone, &out.DisplayName,
+				&out.Status, &out.MFAEnabled, &out.TOTPSecret, &out.CreatedAt, &out.LastLoginAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r userRepo) GetByUsername(ctx context.Context, username string) (*types.User, error) {
+	out := &types.User{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,username,COALESCE(email,''),COALESCE(phone,''),COALESCE(display_name,''),
+			status,mfa_enabled,COALESCE(totp_secret,''),created_at,last_login_at FROM users WHERE username=$1`, username).
+			Scan(&out.ID, &out.Username, &out.Email, &out.Phone, &out.DisplayName,
+				&out.Status, &out.MFAEnabled, &out.TOTPSecret, &out.CreatedAt, &out.LastLoginAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r userRepo) TouchLogin(ctx context.Context, id string, at time.Time) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE users SET last_login_at=$2 WHERE id=$1`, id, at)
+		return wrapErr(err)
+	})
+}
+
+type credRepo struct{ base }
+
+func (r credRepo) Get(ctx context.Context, userID string) (*types.Credential, error) {
+	out := &types.Credential{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT user_id,password_enc,algo,key_version,updated_at
+			FROM credentials WHERE user_id=$1`, userID).
+			Scan(&out.UserID, &out.PasswordEnc, &out.Algo, &out.KeyVersion, &out.UpdatedAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r credRepo) Upsert(ctx context.Context, c *types.Credential) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO credentials(user_id,password_enc,algo,key_version,updated_at)
+			VALUES($1,$2,$3,$4,$5)
+			ON CONFLICT(user_id) DO UPDATE SET password_enc=EXCLUDED.password_enc,
+			algo=EXCLUDED.algo,key_version=EXCLUDED.key_version,updated_at=EXCLUDED.updated_at`,
+			c.UserID, c.PasswordEnc, c.Algo, c.KeyVersion, c.UpdatedAt)
+		return wrapErr(err)
+	})
+}
+
+// ---------- 成员 ----------
+
+type memberRepo struct{ base }
+
+func (r memberRepo) Create(ctx context.Context, m *types.Membership) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO memberships(id,tenant_id,user_id,status,invited_by,joined_at)
+			VALUES($1,$2,$3,$4,$5,$6)`, m.ID, m.TenantID, m.UserID, m.Status, nullStr(m.InvitedBy), m.JoinedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r memberRepo) Get(ctx context.Context, tenantID, userID string) (*types.Membership, error) {
+	out := &types.Membership{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,tenant_id,user_id,status,COALESCE(invited_by,''),joined_at
+			FROM memberships WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID).
+			Scan(&out.ID, &out.TenantID, &out.UserID, &out.Status, &out.InvitedBy, &out.JoinedAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r memberRepo) ListByTenant(ctx context.Context, tenantID string) ([]types.Membership, error) {
+	out := []types.Membership{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,status,COALESCE(invited_by,''),joined_at
+			FROM memberships WHERE tenant_id=$1 ORDER BY joined_at DESC`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m types.Membership
+			if err := rows.Scan(&m.ID, &m.TenantID, &m.UserID, &m.Status, &m.InvitedBy, &m.JoinedAt); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// ListByUser 登录阶段按用户查所属团队：此时租户未知，走 memberships 的
+// login_lookup 策略（仅允许 SELECT 且必须带 user_id 谓词）。
+func (r memberRepo) ListByUser(ctx context.Context, userID string) ([]types.Membership, error) {
+	out := []types.Membership{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,status,COALESCE(invited_by,''),joined_at
+			FROM memberships WHERE user_id=$1 ORDER BY joined_at DESC`, userID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m types.Membership
+			if err := rows.Scan(&m.ID, &m.TenantID, &m.UserID, &m.Status, &m.InvitedBy, &m.JoinedAt); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// ---------- 角色 ----------
+
+type roleRepo struct{ base }
+
+func (r roleRepo) Create(ctx context.Context, role *types.Role) error {
+	return r.run(ctx, func(q querier) error {
+		if _, err := q.Exec(ctx, `INSERT INTO roles(id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			role.ID, nullStr(role.TenantID), role.Code, role.Name, role.Builtin,
+			role.MaskFields, role.DenyElement, role.DataScope, role.CreatedAt); err != nil {
+			return wrapErr(err)
+		}
+		for _, p := range role.Permissions {
+			if _, err := q.Exec(ctx, `INSERT INTO role_permissions(role_id,permission_key) VALUES($1,$2)
+				ON CONFLICT DO NOTHING`, role.ID, p); err != nil {
+				return wrapErr(err)
+			}
+		}
+		return nil
+	})
+}
+
+func (r roleRepo) Get(ctx context.Context, id string) (*types.Role, error) {
+	role := &types.Role{}
+	var tenantID *string
+	err := r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at
+			FROM roles WHERE id=$1`, id).Scan(&role.ID, &tenantID, &role.Code, &role.Name, &role.Builtin,
+			&role.MaskFields, &role.DenyElement, &role.DataScope, &role.CreatedAt); err != nil {
+			return err
+		}
+		return loadPerms(ctx, q, role.ID, role)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	if tenantID != nil {
+		role.TenantID = *tenantID
+	}
+	return role, nil
+}
+
+func (r roleRepo) GetByCode(ctx context.Context, tenantID, code string) (*types.Role, error) {
+	role := &types.Role{}
+	var tid *string
+	err := r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at
+			FROM roles WHERE COALESCE(tenant_id,'~') = COALESCE($1,'~') AND code=$2`, nullStr(tenantID), code).
+			Scan(&role.ID, &tid, &role.Code, &role.Name, &role.Builtin,
+				&role.MaskFields, &role.DenyElement, &role.DataScope, &role.CreatedAt); err != nil {
+			return err
+		}
+		return loadPerms(ctx, q, role.ID, role)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	if tid != nil {
+		role.TenantID = *tid
+	}
+	return role, nil
+}
+
+func (r roleRepo) List(ctx context.Context, tenantID string) ([]types.Role, error) {
+	out := []types.Role{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at
+			FROM roles WHERE tenant_id IS NULL OR tenant_id=$1 ORDER BY code`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var role types.Role
+			var tid *string
+			if err := rows.Scan(&role.ID, &tid, &role.Code, &role.Name, &role.Builtin,
+				&role.MaskFields, &role.DenyElement, &role.DataScope, &role.CreatedAt); err != nil {
+				return err
+			}
+			if tid != nil {
+				role.TenantID = *tid
+			}
+			out = append(out, role)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for i := range out {
+			if err := loadPerms(ctx, q, out[i].ID, &out[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return out, wrapErr(err)
+}
+
+func (r roleRepo) SetPermissions(ctx context.Context, id string, perms []string) error {
+	return r.run(ctx, func(q querier) error {
+		if _, err := q.Exec(ctx, `DELETE FROM role_permissions WHERE role_id=$1`, id); err != nil {
+			return wrapErr(err)
+		}
+		for _, p := range perms {
+			if _, err := q.Exec(ctx, `INSERT INTO role_permissions(role_id,permission_key) VALUES($1,$2)
+				ON CONFLICT DO NOTHING`, id, p); err != nil {
+				return wrapErr(err)
+			}
+		}
+		return nil
+	})
+}
+
+func loadPerms(ctx context.Context, q querier, roleID string, role *types.Role) error {
+	rows, err := q.Query(ctx, `SELECT permission_key FROM role_permissions WHERE role_id=$1`, roleID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	role.Permissions = []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return err
+		}
+		role.Permissions = append(role.Permissions, p)
+	}
+	return rows.Err()
+}
+
+type userRoleRepo struct{ base }
+
+func (r userRoleRepo) Assign(ctx context.Context, ur *types.UserRole) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO user_roles(id,tenant_id,user_id,role_id,granted_by,granted_at)
+			VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,user_id,role_id) DO NOTHING`,
+			ur.ID, ur.TenantID, ur.UserID, ur.RoleID, nullStr(ur.GrantedBy), ur.GrantedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r userRoleRepo) Revoke(ctx context.Context, tenantID, userID, roleID string) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `DELETE FROM user_roles WHERE tenant_id=$1 AND user_id=$2 AND role_id=$3`,
+			tenantID, userID, roleID)
+		return wrapErr(err)
+	})
+}
+
+func (r userRoleRepo) ListByUser(ctx context.Context, tenantID, userID string) ([]types.UserRole, error) {
+	out := []types.UserRole{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,role_id,COALESCE(granted_by,''),granted_at
+			FROM user_roles WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var ur types.UserRole
+			if err := rows.Scan(&ur.ID, &ur.TenantID, &ur.UserID, &ur.RoleID, &ur.GrantedBy, &ur.GrantedAt); err != nil {
+				return err
+			}
+			out = append(out, ur)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+func (r userRoleRepo) ListByTenant(ctx context.Context, tenantID string) ([]types.UserRole, error) {
+	out := []types.UserRole{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,role_id,COALESCE(granted_by,''),granted_at
+			FROM user_roles WHERE tenant_id=$1`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var ur types.UserRole
+			if err := rows.Scan(&ur.ID, &ur.TenantID, &ur.UserID, &ur.RoleID, &ur.GrantedBy, &ur.GrantedAt); err != nil {
+				return err
+			}
+			out = append(out, ur)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+type grantRepo struct{ base }
+
+func (r grantRepo) Create(ctx context.Context, g *types.DataGrant) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO data_grants(id,tenant_id,user_id,resource_type,resource_id,scope,granted_by,expires_at,created_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			g.ID, g.TenantID, g.UserID, g.ResourceType, g.ResourceID, nullStr(g.Scope),
+			nullStr(g.GrantedBy), g.ExpiresAt, g.CreatedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r grantRepo) ListByUser(ctx context.Context, tenantID, userID, resourceType string) ([]types.DataGrant, error) {
+	out := []types.DataGrant{}
+	err := r.run(ctx, func(q querier) error {
+		sql := `SELECT id,tenant_id,user_id,resource_type,resource_id,COALESCE(scope,''),COALESCE(granted_by,''),expires_at,created_at
+			FROM data_grants WHERE tenant_id=$1 AND user_id=$2`
+		args := []any{tenantID, userID}
+		if resourceType != "" {
+			sql += ` AND resource_type=$3`
+			args = append(args, resourceType)
+		}
+		sql += ` AND (expires_at IS NULL OR expires_at > now())`
+		rows, err := q.Query(ctx, sql, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g types.DataGrant
+			if err := rows.Scan(&g.ID, &g.TenantID, &g.UserID, &g.ResourceType, &g.ResourceID,
+				&g.Scope, &g.GrantedBy, &g.ExpiresAt, &g.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, g)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// ---------- 会话 ----------
+
+type sessionRepo struct{ base }
+
+func (r sessionRepo) Create(ctx context.Context, s *types.Session) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO sessions(id,user_id,tenant_id,ip,user_agent,terminal_fp,client_ver,
+			created_at,last_seen_at,expires_at,revoked_at,login_result,blocked_cause)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			s.ID, s.UserID, s.TenantID, nullStr(s.IP), nullStr(s.UserAgent), nullStr(s.TerminalFP),
+			nullStr(s.ClientVer), s.CreatedAt, s.LastSeenAt, s.ExpiresAt, s.RevokedAt,
+			s.LoginResult, nullStr(s.BlockedCause))
+		return wrapErr(err)
+	})
+}
+
+func (r sessionRepo) Get(ctx context.Context, id string) (*types.Session, error) {
+	out := &types.Session{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,user_id,tenant_id,COALESCE(ip,''),COALESCE(user_agent,''),
+			COALESCE(terminal_fp,''),COALESCE(client_ver,''),created_at,last_seen_at,expires_at,revoked_at,
+			login_result,COALESCE(blocked_cause,'') FROM sessions WHERE id=$1`, id).
+			Scan(&out.ID, &out.UserID, &out.TenantID, &out.IP, &out.UserAgent, &out.TerminalFP,
+				&out.ClientVer, &out.CreatedAt, &out.LastSeenAt, &out.ExpiresAt, &out.RevokedAt,
+				&out.LoginResult, &out.BlockedCause)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r sessionRepo) Revoke(ctx context.Context, id string) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE sessions SET revoked_at=now() WHERE id=$1`, id)
+		return wrapErr(err)
+	})
+}
+
+func (r sessionRepo) ListByUser(ctx context.Context, userID string) ([]types.Session, error) {
+	out := []types.Session{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,user_id,tenant_id,COALESCE(ip,''),COALESCE(user_agent,''),
+			COALESCE(terminal_fp,''),COALESCE(client_ver,''),created_at,last_seen_at,expires_at,revoked_at,
+			login_result,COALESCE(blocked_cause,'') FROM sessions WHERE user_id=$1`, userID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var s types.Session
+			if err := rows.Scan(&s.ID, &s.UserID, &s.TenantID, &s.IP, &s.UserAgent, &s.TerminalFP,
+				&s.ClientVer, &s.CreatedAt, &s.LastSeenAt, &s.ExpiresAt, &s.RevokedAt,
+				&s.LoginResult, &s.BlockedCause); err != nil {
+				return err
+			}
+			out = append(out, s)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// ---------- 店铺 ----------
+
+type shopRepo struct{ base }
+
+func (r shopRepo) Create(ctx context.Context, s *types.Shop) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO shops(id,tenant_id,name,platform,site,status,group_name,tags,device_id,owner_id,profit,cost,balance,created_at,updated_at,deleted_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+			s.ID, s.TenantID, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status,
+			nullStr(s.Group), s.Tags, nullStr(s.DeviceID), s.OwnerID,
+			s.Profit, s.Cost, s.Balance, s.CreatedAt, s.UpdatedAt, s.DeletedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r shopRepo) Get(ctx context.Context, id string) (*types.Shop, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &types.Shop{}
+	err = r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,tenant_id,name,COALESCE(platform,''),COALESCE(site,''),status,
+			COALESCE(group_name,''),tags,COALESCE(device_id,''),owner_id,
+			profit,cost,balance,created_at,updated_at,deleted_at FROM shops WHERE id=$1 AND tenant_id=$2`, id, tid).
+			Scan(&out.ID, &out.TenantID, &out.Name, &out.Platform, &out.Site, &out.Status, &out.Group,
+				&out.Tags, &out.DeviceID, &out.OwnerID,
+				&out.Profit, &out.Cost, &out.Balance, &out.CreatedAt, &out.UpdatedAt, &out.DeletedAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r shopRepo) List(ctx context.Context, f store.ShopFilter) ([]types.Shop, int, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []types.Shop{}
+	total := 0
+	where := `WHERE tenant_id=$1`
+	args := []any{tid}
+	if f.Deleted {
+		where += ` AND deleted_at IS NOT NULL`
+	} else if !f.IncludeDeleted {
+		where += ` AND deleted_at IS NULL`
+	}
+	if f.Scope == "own" {
+		where += ` AND owner_id=$2`
+		args = append(args, f.OwnerID)
+	}
+	err = r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT COUNT(*) FROM shops `+where, args...).Scan(&total); err != nil {
+			return err
+		}
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,name,COALESCE(platform,''),COALESCE(site,''),status,
+			COALESCE(group_name,''),tags,COALESCE(device_id,''),owner_id,
+			profit,cost,balance,created_at,updated_at,deleted_at FROM shops `+where+`
+			ORDER BY created_at DESC LIMIT $`+fmt.Sprint(len(args)+1)+` OFFSET $`+fmt.Sprint(len(args)+2),
+			append(args, f.Limit, f.Offset)...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var s types.Shop
+			if err := rows.Scan(&s.ID, &s.TenantID, &s.Name, &s.Platform, &s.Site, &s.Status, &s.Group,
+				&s.Tags, &s.DeviceID, &s.OwnerID,
+				&s.Profit, &s.Cost, &s.Balance, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt); err != nil {
+				return err
+			}
+			out = append(out, s)
+		}
+		return rows.Err()
+	})
+	return out, total, wrapErr(err)
+}
+
+func (r shopRepo) Update(ctx context.Context, s *types.Shop) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE shops SET name=$3,platform=$4,site=$5,status=$6,group_name=$7,tags=$8,
+			device_id=$9,owner_id=$10,profit=$11,cost=$12,balance=$13,updated_at=$14,deleted_at=$15
+			WHERE id=$1 AND tenant_id=$2`,
+			s.ID, tid, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status, nullStr(s.Group),
+			s.Tags, nullStr(s.DeviceID), s.OwnerID, s.Profit, s.Cost, s.Balance, s.UpdatedAt, s.DeletedAt)
+		return err
+	}))
+}
+
+func (r shopRepo) Count(ctx context.Context) (int, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	err = r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT COUNT(*) FROM shops WHERE tenant_id=$1 AND deleted_at IS NULL`, tid).Scan(&n)
+	})
+	return n, wrapErr(err)
+}
+
+func (r shopRepo) Delete(ctx context.Context, id string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		// 只允许物理删除已软删的数据（未进回收站的行 deleted_at IS NULL，删除 0 行）
+		tag, err := q.Exec(ctx, `DELETE FROM shops WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NOT NULL`, id, tid)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return apierr.NotFound("店铺不存在或尚未进入回收站（禁止物理删除在营店铺）")
+		}
+		return nil
+	}))
+}
+
+// ---------- 订阅与计量 ----------
+
+type subRepo struct{ base }
+
+func (r subRepo) Create(ctx context.Context, s *types.Subscription) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO subscriptions(id,tenant_id,plan_code,status,started_at,expires_at)
+			VALUES($1,$2,$3,$4,$5,$6)`, s.ID, s.TenantID, s.PlanCode, s.Status, s.StartedAt, s.ExpiresAt)
+		return wrapErr(err)
+	})
+}
+
+func (r subRepo) GetActive(ctx context.Context, tenantID string) (*types.Subscription, error) {
+	out := &types.Subscription{}
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,tenant_id,plan_code,status,started_at,expires_at
+			FROM subscriptions WHERE tenant_id=$1 AND status='active' ORDER BY started_at DESC LIMIT 1`, tenantID).
+			Scan(&out.ID, &out.TenantID, &out.PlanCode, &out.Status, &out.StartedAt, &out.ExpiresAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+type usageRepo struct{ base }
+
+func (r usageRepo) Incr(ctx context.Context, tenantID, metric string, delta int64) (int64, error) {
+	var v int64
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `INSERT INTO usage_counters(tenant_id,metric,value,updated_at)
+			VALUES($1,$2,$3,now()) ON CONFLICT(tenant_id,metric)
+			DO UPDATE SET value=usage_counters.value+EXCLUDED.value, updated_at=now() RETURNING value`,
+			tenantID, metric, delta).Scan(&v)
+	})
+	return v, wrapErr(err)
+}
+
+func (r usageRepo) Get(ctx context.Context, tenantID, metric string) (int64, error) {
+	var v int64
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT COALESCE(value,0) FROM usage_counters WHERE tenant_id=$1 AND metric=$2`,
+			tenantID, metric).Scan(&v)
+	})
+	if isNoRows(err) {
+		return 0, nil
+	}
+	return v, wrapErr(err)
+}
+
+// ---------- 发件箱 ----------
+
+type outboxRepo struct{ base }
+
+func (r outboxRepo) Insert(ctx context.Context, e *types.OutboxEnvelope) error {
+	return r.run(ctx, func(q querier) error {
+		payload := e.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage("{}")
+		}
+		_, err := q.Exec(ctx, `INSERT INTO event_outbox(id,tenant_id,type,payload,status,attempts,available_at,last_error,created_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			e.ID, e.TenantID, e.Type, payload, e.Status, e.Attempts, e.AvailableAt, nullStr(e.LastError), e.CreatedAt)
+		return wrapErr(err)
+	})
+}
+
+func (r outboxRepo) Claim(ctx context.Context, limit int) ([]types.OutboxEnvelope, error) {
+	out := []types.OutboxEnvelope{}
+	err := r.run(ctx, func(q querier) error {
+		// SKIP LOCKED：多实例并发派发不互相阻塞
+		rows, err := q.Query(ctx, `UPDATE event_outbox SET status='claimed'
+			WHERE id IN (SELECT id FROM event_outbox WHERE status='pending' AND available_at <= now()
+			  ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED)
+			RETURNING id,tenant_id,type,payload,status,attempts,available_at,COALESCE(last_error,''),created_at`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e types.OutboxEnvelope
+			if err := rows.Scan(&e.ID, &e.TenantID, &e.Type, &e.Payload, &e.Status, &e.Attempts,
+				&e.AvailableAt, &e.LastError, &e.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+func (r outboxRepo) Ack(ctx context.Context, id string) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE event_outbox SET status='done' WHERE id=$1`, id)
+		return wrapErr(err)
+	})
+}
+
+func (r outboxRepo) Fail(ctx context.Context, id, errMsg string) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE event_outbox SET status='pending', attempts=attempts+1,
+			last_error=$2, available_at=now() + make_interval(secs => attempts::double precision) WHERE id=$1`, id, errMsg)
+		return wrapErr(err)
+	})
+}
+
+// ---------- 审计 ----------
+
+type auditRepo struct{ base }
+
+func (r auditRepo) Append(ctx context.Context, e *types.AuditEntry) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	e.TenantID = tid
+	var prev string
+	err = r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT COALESCE(hash,'') FROM audit_log WHERE tenant_id=$1
+			ORDER BY occurred_at DESC, id DESC LIMIT 1`, tid).Scan(&prev); err != nil && !isNoRows(err) {
+			return err
+		}
+		e.PrevHash = prev
+		e.Hash = store.AuditHash(prev, e)
+		data := e.Data
+		if len(data) == 0 {
+			data = json.RawMessage("{}")
+		}
+		_, err := q.Exec(ctx, `INSERT INTO audit_log(id,tenant_id,category,actor_user_id,actor_name,shop_id,device_id,
+			terminal_ip,terminal_fp,action,result,url,occurred_at,data,prev_hash,hash)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+			e.ID, e.TenantID, string(e.Category), nullStr(e.ActorUserID), nullStr(e.ActorName),
+			nullStr(e.ShopID), nullStr(e.DeviceID), nullStr(e.TerminalIP), nullStr(e.TerminalFP),
+			e.Action, e.Result, nullStr(e.URL), e.OccurredAt, data, e.PrevHash, e.Hash)
+		return err
+	})
+	return wrapErr(err)
+}
+
+func (r auditRepo) Last(ctx context.Context, tenantID string) (*types.AuditEntry, error) {
+	out := &types.AuditEntry{}
+	var category string
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,tenant_id,category,COALESCE(actor_user_id,''),COALESCE(actor_name,''),
+			COALESCE(shop_id,''),COALESCE(device_id,''),COALESCE(terminal_ip,''),COALESCE(terminal_fp,''),
+			action,result,COALESCE(url,''),occurred_at,COALESCE(data,'{}'::jsonb),prev_hash,hash
+			FROM audit_log WHERE tenant_id=$1 ORDER BY occurred_at DESC, id DESC LIMIT 1`, tenantID).
+			Scan(&out.ID, &out.TenantID, &category, &out.ActorUserID, &out.ActorName, &out.ShopID,
+				&out.DeviceID, &out.TerminalIP, &out.TerminalFP, &out.Action, &out.Result, &out.URL,
+				&out.OccurredAt, &out.Data, &out.PrevHash, &out.Hash)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	out.Category = types.AuditCategory(category)
+	return out, nil
+}
+
+func (r auditRepo) List(ctx context.Context, f store.AuditFilter) ([]types.AuditEntry, int, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	where := `WHERE tenant_id=$1`
+	args := []any{tid}
+	idx := 2
+	if f.Category != "" {
+		where += fmt.Sprintf(` AND category=$%d`, idx)
+		args, idx = append(args, string(f.Category)), idx+1
+	}
+	if f.ActorUserID != "" {
+		where += fmt.Sprintf(` AND actor_user_id=$%d`, idx)
+		args, idx = append(args, f.ActorUserID), idx+1
+	}
+	if f.ShopID != "" {
+		where += fmt.Sprintf(` AND shop_id=$%d`, idx)
+		args, idx = append(args, f.ShopID), idx+1
+	}
+	if f.Action != "" {
+		where += fmt.Sprintf(` AND action=$%d`, idx)
+		args, idx = append(args, f.Action), idx+1
+	}
+	if f.From != nil {
+		where += fmt.Sprintf(` AND occurred_at >= $%d`, idx)
+		args, idx = append(args, *f.From), idx+1
+	}
+	if f.To != nil {
+		where += fmt.Sprintf(` AND occurred_at <= $%d`, idx)
+		args, idx = append(args, *f.To), idx+1
+	}
+	if f.Keyword != "" {
+		where += fmt.Sprintf(` AND (action ILIKE $%d OR actor_name ILIKE $%d OR data::text ILIKE $%d)`, idx, idx, idx)
+		args, idx = append(args, "%"+f.Keyword+"%"), idx+1
+	}
+	out := []types.AuditEntry{}
+	total := 0
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	err = r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT COUNT(*) FROM audit_log `+where, args...).Scan(&total); err != nil {
+			return err
+		}
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,category,COALESCE(actor_user_id,''),COALESCE(actor_name,''),
+			COALESCE(shop_id,''),COALESCE(device_id,''),COALESCE(terminal_ip,''),COALESCE(terminal_fp,''),
+			action,result,COALESCE(url,''),occurred_at,COALESCE(data,'{}'::jsonb),prev_hash,hash
+			FROM audit_log `+where+` ORDER BY occurred_at DESC
+			LIMIT `+fmt.Sprint(limit)+` OFFSET `+fmt.Sprint(f.Offset), args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e types.AuditEntry
+			var category string
+			if err := rows.Scan(&e.ID, &e.TenantID, &category, &e.ActorUserID, &e.ActorName, &e.ShopID,
+				&e.DeviceID, &e.TerminalIP, &e.TerminalFP, &e.Action, &e.Result, &e.URL,
+				&e.OccurredAt, &e.Data, &e.PrevHash, &e.Hash); err != nil {
+				return err
+			}
+			e.Category = types.AuditCategory(category)
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, total, wrapErr(err)
+}
+
+func (r auditRepo) Since(ctx context.Context, tenantID string, from time.Time) ([]types.AuditEntry, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []types.AuditEntry{}
+	err = r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,category,COALESCE(actor_user_id,''),COALESCE(actor_name,''),
+			COALESCE(shop_id,''),COALESCE(device_id,''),COALESCE(terminal_ip,''),COALESCE(terminal_fp,''),
+			action,result,COALESCE(url,''),occurred_at,COALESCE(data,'{}'::jsonb),prev_hash,hash
+			FROM audit_log WHERE tenant_id=$1 AND occurred_at >= $2 ORDER BY occurred_at ASC, id ASC`, tid, from)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e types.AuditEntry
+			var category string
+			if err := rows.Scan(&e.ID, &e.TenantID, &category, &e.ActorUserID, &e.ActorName, &e.ShopID,
+				&e.DeviceID, &e.TerminalIP, &e.TerminalFP, &e.Action, &e.Result, &e.URL,
+				&e.OccurredAt, &e.Data, &e.PrevHash, &e.Hash); err != nil {
+				return err
+			}
+			e.Category = types.AuditCategory(category)
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// ---------- 通知 ----------
+
+type notifRepo struct{ base }
+
+func (r notifRepo) Create(ctx context.Context, n *types.Notification) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO notifications(id,tenant_id,user_id,category,title,body,event_type,channels,created_at,read_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			n.ID, n.TenantID, n.UserID, n.Category, n.Title, n.Body, nullStr(n.EventType), n.Channels, n.CreatedAt, n.ReadAt)
+		return wrapErr(err)
+	})
+}
+
+func (r notifRepo) List(ctx context.Context, tenantID, userID string, limit int) ([]types.Notification, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	out := []types.Notification{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,category,title,body,COALESCE(event_type,''),
+			channels,created_at,read_at FROM notifications WHERE tenant_id=$1 AND user_id=$2
+			ORDER BY created_at DESC LIMIT $3`, tenantID, userID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var n types.Notification
+			if err := rows.Scan(&n.ID, &n.TenantID, &n.UserID, &n.Category, &n.Title, &n.Body,
+				&n.EventType, &n.Channels, &n.CreatedAt, &n.ReadAt); err != nil {
+				return err
+			}
+			out = append(out, n)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+func (r notifRepo) MarkRead(ctx context.Context, tenantID, id string) error {
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE notifications SET read_at=now() WHERE tenant_id=$1 AND id=$2`, tenantID, id)
+		return wrapErr(err)
+	})
+}
+
+// ---------- 辅助 ----------
+
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func isNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
+
+// wrapErr 把 pgx 错误翻译成平台错误码；L4：不得回显原始 SQL 细节给客户端。
+func wrapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isNoRows(err) {
+		return apierr.NotFound("记录不存在")
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			return apierr.Conflict("记录已存在")
+		case "42501":
+			return apierr.Forbidden("行级安全策略拒绝了该操作（租户隔离）")
+		}
+	}
+	return err
+}

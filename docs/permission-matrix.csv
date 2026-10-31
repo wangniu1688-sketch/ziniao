@@ -1,0 +1,26 @@
+permission_key,layer,group,risk,owner,ops_manager,operator,cs,finance,备注
+shop:create,function,店铺,medium,Y,Y,Y,N,N,新建店铺
+shop:read,function,店铺,low,Y,Y,Y,Y,Y,查看店铺
+shop:update,function,店铺,medium,Y,Y,Y,N,N,修改店铺
+shop:delete,function,店铺,high,Y,Y,N,N,N,删除/回收店铺
+member:invite,function,团队,medium,Y,Y,N,N,N,邀请/添加成员
+member:list,function,团队,low,Y,Y,N,N,N,查看成员列表
+role:grant,function,团队,high,Y,N,N,N,N,授予角色（管理变动类→权限日志）
+role:manage,function,团队,high,Y,N,N,N,N,角色与权限管理
+audit:read,function,安全,medium,Y,Y,N,N,N,查看审计日志
+audit:export,function,安全,high,Y,N,N,N,N,导出需二次审批（obligation=require_approval）
+finance:read,function,财务,high,Y,N,N,N,Y,财务角色可见但字段被遮蔽
+page:shops,page,店铺,,Y,Y,Y,Y,Y,店铺列表页
+page:finance,page,财务,,Y,N,N,N,Y,财务管理页
+page:audit,page,安全,,Y,Y,N,N,N,审计日志页
+page:team,page,团队,,Y,Y,N,N,N,团队管理页
+element:shop.delete_button,element,店铺,,Y,Y,N,N,N,DOM 选择器 [data-el="shop.delete_button"]
+element:shop.export_button,element,店铺,,Y,Y,N,N,N,DOM 选择器 [data-el="shop.export_button"]
+element:finance.export_button,element,财务,,Y,N,N,N,N,财务角色亦被屏蔽（防导出明文）
+element:finance.profit_field,element,财务,,Y,N,N,N,N,利润字段元素级屏蔽
+data:shop,data,店铺,,all,all,own,own,all,数据范围决定可见行
+resource:device.purchase,resource,设备,,Y,Y,N,N,N,购买云网络设备
+resource:box.purchase,resource,设备,,Y,N,N,N,N,紫鸟盒子购买权（官方资源级权限实例）
+mask:profit,obligation,财务,,-,-,-,-,Y,利润字段替换为 ***
+mask:cost,obligation,财务,,-,-,-,-,Y,成本字段替换为 ***
+mask:balance,obligation,财务,,-,-,-,-,Y,收款余额字段替换为 ***

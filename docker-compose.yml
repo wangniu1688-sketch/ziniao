@@ -1,0 +1,33 @@
+# Phase 0 本地基础设施：PostgreSQL（主库）+ Redis（缓存/分布式锁预留）
+# 用法：docker compose up -d && make migrate && make dev
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ziniao-db
+    environment:
+      POSTGRES_USER: ziniao
+      POSTGRES_PASSWORD: ziniao
+      POSTGRES_DB: ziniao
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ziniao"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ziniao-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db-data:

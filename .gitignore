@@ -1,0 +1,40 @@
+# 二进制与构建产物
+/server
+/server.exe
+/dist/
+/target/
+
+# 本地环境
+.env
+.env.local
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# Go 测试缓存（按需）
+coverage.out
+
+# ---- 桌面客户端构建产物 ----
+# target 单目录就 1.6GB，绝不能入库
+client/node_modules/
+client/dist/
+client/src-tauri/target/
+client/src-tauri/gen/
+# sidecar 是 go build 产出（每次改 network/cmd 都要重建），入库只会造成误用旧二进制
+client/src-tauri/sidecar/
+
+# ---- 环境 profile：每个店铺环境的 Cookie / localStorage ----
+# 这里存的是真实登录态（哪怕是本地测试的），一旦入库等于永久泄露且可被别人 checkout 回去
+profiles/
+*.localstorage
+
+# ---- 本地 MITM 根证书私钥 ----
+*.crt
+*.key
+*.pem

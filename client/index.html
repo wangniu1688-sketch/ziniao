@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:" />
+  <title>紫鸟浏览器</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0f1a; color: #e8edf8;
+      font: 14px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+      background: linear-gradient(90deg, #16203a, #101728); border-bottom: 1px solid #26304a; }
+    .brand { font-weight: 700; letter-spacing: 1px; }
+    .brand::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+      background: linear-gradient(135deg, #4d7fff, #9f6bff); margin-right: 8px; }
+    header .spacer { flex: 1; }
+    header input { width: 240px; }
+    input { background: #1a2338; border: 1px solid #26304a; color: #e8edf8;
+      border-radius: 8px; padding: 6px 10px; }
+    button { background: #4d7fff; border: none; color: #fff; border-radius: 8px;
+      padding: 6px 14px; cursor: pointer; font-size: 13px; }
+    button.ghost { background: transparent; border: 1px solid #26304a; color: #8d9ab8; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    main { padding: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #26304a; font-size: 13px; }
+    th { color: #8d9ab8; font-weight: 500; font-size: 12px; }
+    .tag { display: inline-block; padding: 1px 9px; border-radius: 20px; font-size: 12px;
+      background: rgba(52,211,153,.14); color: #34d399; border: 1px solid rgba(52,211,153,.35); }
+    .tag.gray { background: rgba(141,154,184,.14); color: #8d9ab8; border-color: rgba(141,154,184,.35); }
+    .hint { color: #8d9ab8; font-size: 12px; }
+    #status { margin-top: 14px; padding: 10px 14px; border-radius: 10px; background: #131a2a;
+      border: 1px solid #26304a; white-space: pre-wrap; font-size: 13px; display: none; }
+    #status.err { border-color: #f87171; color: #f87171; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="brand">紫鸟浏览器</span>
+    <input id="base" value="http://127.0.0.1:8080" />
+    <input id="user" placeholder="用户名" value="demo" style="width:120px" />
+    <input id="pass" type="password" placeholder="口令" value="Zn@12345678" style="width:140px" />
+    <button id="login">登录</button>
+    <span class="spacer"></span>
+    <button id="reload" class="ghost">刷新环境</button>
+    <span id="who" class="hint"></span>
+  </header>
+
+  <main>
+    <p class="hint">每行一个店铺：点「启动环境」会按服务端下发的
+      <b>UA / 注入脚本 / 代理端口 / 内核基线</b> 打开一个<b>独立 profile 目录</b>的浏览器窗口，
+      两个不同店铺的环境互不串 cookie。</p>
+    <table>
+      <thead><tr>
+        <th style="width:22%">店铺</th><th style="width:12%">平台/站点</th>
+        <th style="width:12%">状态</th><th style="width:26%">环境（内核/基线）</th><th>操作</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="status"></div>
+  </main>
+
+  <script type="module">
+    import { invoke } from './api/core.js';
+
+    const $ = (id) => document.getElementById(id);
+    let spec = null; // 当前登录凭证与服务地址
+
+    function status(msg, isErr) {
+      const el = $('status');
+      el.style.display = 'block';
+      el.className = isErr ? 'err' : '';
+      el.textContent = msg;
+    }
+
+    async function api(path, options) {
+      const res = await fetch($('base').value.replace(/\/$/, '') + path, options);
+      const text = await res.text();
+      if (!res.ok) throw new Error(text || ('HTTP ' + res.status));
+      return text ? JSON.parse(text) : {};
+    }
+
+    async function login() {
+      try {
+        const r = await api('/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: $('user').value, password: $('pass').value, url: '/client' }),
+        });
+        const me = await api('/api/v1/me', { headers: { Authorization: 'Bearer ' + r.token } });
+        spec = { token: r.token };
+        $('who').textContent = '已登录 ' + (me.username || r.username || '') + (me.roles ? '（' + me.roles.join('/') + '）' : '');
+        await loadEnvs();
+      } catch (e) {
+        status('登录失败：' + e.message, true);
+      }
+    }
+
+    async function loadEnvs() {
+      if (!spec) { status('请先登录', true); return; }
+      const auth = { Authorization: 'Bearer ' + spec.token };
+      const shops = (await api('/api/v1/shops?limit=200', { headers: auth })).items || [];
+      const rows = $('rows');
+      rows.innerHTML = '';
+      for (const s of shops) {
+        let env = null;
+        try { env = await api('/api/v1/shops/' + s.id + '/environment', { headers: auth }); } catch (_) { env = null; }
+        const tr = document.createElement('tr');
+        const hasEnv = env && env.id;
+        tr.innerHTML =
+          '<td>' + escape(s.name) + '</td>' +
+          '<td>' + escape(s.platform || '-') + ' / ' + escape(s.site || '-') + '</td>' +
+          '<td>' + escape(s.status || '-') + '</td>' +
+          '<td>' + (hasEnv
+            ? 'Chrome ' + env.kernel_major + ' · <span class="tag">' + String(env.baseline_hash || '').slice(0, 10) + '</span>'
+            : '<span class="tag gray">未创建环境</span>') + '</td>';
+        const td = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.textContent = hasEnv ? '启动环境' : '创建环境';
+        btn.disabled = !hasEnv;
+        btn.onclick = () => launch(s.id, s.name);
+        td.appendChild(btn);
+        tr.appendChild(td);
+        rows.appendChild(tr);
+      }
+      if (!shops.length) rows.innerHTML = '<tr><td colspan="5" class="hint">没有店铺，先去控制台建店</td></tr>';
+    }
+
+    async function launch(shopId, shopName) {
+      status('正在向服务端申请启动单…');
+      try {
+        const msg = await invoke('launch_env', {
+          input: {
+            base_url: $('base').value,
+            token: spec.token,
+            shop_id: shopId,
+            open_url: '',
+          },
+        });
+        status('✓ ' + msg);
+      } catch (e) {
+        status('启动失败：' + (e && e.message ? e.message : String(e)), true);
+      }
+    }
+
+    function escape(s) {
+      return String(s === undefined ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    }
+
+    $('login').onclick = login;
+    $('reload').onclick = () => loadEnvs().catch((e) => status('刷新失败：' + e.message, true));
+  </script>
+</body>
+</html>

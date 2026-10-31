@@ -1,0 +1,746 @@
+package gateway
+
+import (
+	"net/http"
+	"strconv"
+
+	"ziniao/device"
+	"ziniao/fingerprint"
+	"ziniao/iam"
+	"ziniao/identity"
+	"ziniao/platform/apierr"
+	"ziniao/platform/store"
+	"ziniao/platform/types"
+	"ziniao/security"
+	"ziniao/shop"
+)
+
+// routesPhase1 Phase 1 路由：设备 / 店铺环境 / 账密托管 / 安全中心 / 指纹基线。
+func (s *Server) routesPhase1() {
+	m := s.mux
+	m.HandleFunc("GET /api/v1/devices", s.authed(s.handleDeviceList))
+	m.HandleFunc("POST /api/v1/devices/purchase", s.authed(s.handleDevicePurchase))
+	m.HandleFunc("POST /api/v1/devices/import", s.authed(s.handleDeviceImport))
+	m.HandleFunc("POST /api/v1/devices/{id}/bind", s.authed(s.handleDeviceBind))
+	m.HandleFunc("POST /api/v1/devices/{id}/renew", s.authed(s.handleDeviceRenew))
+	m.HandleFunc("POST /api/v1/devices/{id}/acquire", s.authed(s.handleDeviceAcquire))
+	m.HandleFunc("POST /api/v1/devices/{id}/release", s.authed(s.handleDeviceRelease))
+	m.HandleFunc("GET /api/v1/devices/{id}/health", s.authed(s.handleDeviceHealth))
+
+	m.HandleFunc("GET /api/v1/shops/trash", s.authed(s.handleShopTrash))
+	m.HandleFunc("POST /api/v1/shops/{id}/restore", s.authed(s.handleShopRestore))
+	m.HandleFunc("POST /api/v1/shops/{id}/status", s.authed(s.handleShopTransition))
+	m.HandleFunc("PUT /api/v1/shops/{id}/group", s.authed(s.handleShopGroup))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment", s.authed(s.handleEnvCreate))
+	m.HandleFunc("GET /api/v1/shops/{id}/environment", s.authed(s.handleEnvGet))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment/check", s.authed(s.handleEnvCheck))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment/launch", s.authed(s.handleEnvLaunch))
+
+	m.HandleFunc("PUT /api/v1/shops/{id}/credentials", s.authed(s.handleCredPut))
+	m.HandleFunc("GET /api/v1/shops/{id}/credentials", s.authed(s.handleCredList))
+	m.HandleFunc("GET /api/v1/shops/{id}/credentials/{kind}", s.authed(s.handleCredReveal))
+
+	m.HandleFunc("GET /api/v1/security/policies", s.authed(s.handlePolicyList))
+	m.HandleFunc("POST /api/v1/security/policies", s.authed(s.handlePolicyUpsert))
+	m.HandleFunc("PUT /api/v1/security/policies/{id}", s.authed(s.handlePolicyUpsert))
+	m.HandleFunc("DELETE /api/v1/security/policies/{id}", s.authed(s.handlePolicyDelete))
+	m.HandleFunc("GET /api/v1/security/events", s.authed(s.handleSecurityEvents))
+	m.HandleFunc("POST /api/v1/security/intercept", s.authed(s.handleIntercept))
+	m.HandleFunc("GET /api/v1/security/templates", s.authed(s.handlePolicyTemplates))
+
+	m.HandleFunc("GET /api/v1/fingerprint/tls-baselines", s.authed(s.handleTLSBaselines))
+	m.HandleFunc("GET /api/v1/fingerprint/layers", s.authed(s.handleFingerprintLayers))
+
+	s.routesPhase2()
+}
+
+// notWired Phase 1 依赖未装配（如仅跑 Phase 0 的最小装配）。
+func (s *Server) notWired(w http.ResponseWriter) {
+	writeErr(w, apierr.Internal("该能力未装配（Phase 1 依赖缺失）"))
+}
+
+// p2subject 取裁决用的身份主体（authorize 已按 token 还原出发起人身份，L3）。
+func p2subject(_ *identity.Principal, subj iam.Subject) iam.Subject { return subj }
+
+// ---------- 设备 ----------
+
+func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "device:read", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	f := store.DeviceFilter{
+		Type:    types.DeviceType(r.URL.Query().Get("type")),
+		Status:  types.DeviceStatus(r.URL.Query().Get("status")),
+		Country: r.URL.Query().Get("country"),
+		Limit:   queryInt(r, "limit", 50), Offset: queryInt(r, "offset", 0),
+	}
+	list, total, err := s.deps.Device.List(r.Context(), p.TenantID, f)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list, "total": total})
+}
+
+func (s *Server) handleDevicePurchase(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:purchase", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Country string `json:"country"`
+		Region  string `json:"region"`
+		City    string `json:"city"`
+		Months  int    `json:"months"`
+		URL     string `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	d, err := s.deps.Device.Purchase(r.Context(), device.PurchaseInput{
+		Name: body.Name, Type: types.DeviceType(body.Type), Country: body.Country,
+		Region: body.Region, City: body.City, PeriodMonths: body.Months,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, d)
+}
+
+func (s *Server) handleDeviceImport(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:import", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Protocol string `json:"protocol"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Country  string `json:"country"`
+		City     string `json:"city"`
+		SN       string `json:"sn"`
+		BindCode string `json:"bind_code"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	act := p2subject(p, subj)
+	term := terminalFrom(r)
+	if body.SN != "" { // 紫鸟盒子
+		d, err := s.deps.Device.ImportBox(r.Context(), device.BoxInput{
+			SN: body.SN, BindCode: body.BindCode, Name: body.Name,
+			Region: body.Country, Actor: act, Terminal: term,
+		})
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, d)
+		return
+	}
+	d, err := s.deps.Device.ImportOwn(r.Context(), device.ImportInput{
+		Name: body.Name, Type: types.DeviceType(body.Type), Protocol: body.Protocol,
+		Host: body.Host, Port: body.Port, Username: body.Username, Password: body.Password,
+		Country: body.Country, City: body.City, Actor: act, Terminal: term,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, d)
+}
+
+func (s *Server) handleDeviceBind(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:bind", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		ShopID string `json:"shop_id"`
+		URL    string `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	b, err := s.deps.Device.Bind(r.Context(), device.BindInput{
+		DeviceID: r.PathValue("id"), ShopID: body.ShopID,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+func (s *Server) handleDeviceRenew(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:renew", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Months int `json:"months"`
+	}
+	_ = decodeJSON(r, &body)
+	if err := s.deps.Device.Renew(r.Context(), r.PathValue("id"), body.Months, p2subject(p, subj), terminalFrom(r)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeviceAcquire(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:read", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		ShopID string `json:"shop_id"`
+	}
+	_ = decodeJSON(r, &body)
+	res, err := s.deps.Device.Acquire(r.Context(), r.PathValue("id"), body.ShopID, p2subject(p, subj), terminalFrom(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleDeviceRelease(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:read", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		BindingID string `json:"binding_id"`
+	}
+	_ = decodeJSON(r, &body)
+	if body.BindingID == "" {
+		body.BindingID = r.PathValue("id")
+	}
+	if err := s.deps.Device.Release(r.Context(), body.BindingID, p2subject(p, subj), terminalFrom(r)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeviceHealth(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "device:read", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	h, err := s.deps.Device.Health(r.Context(), p.TenantID, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
+}
+
+// ---------- 店铺生命周期与环境 ----------
+
+func (s *Server) handleShopTransition(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:transition", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		To     string `json:"to"`
+		Reason string `json:"reason"`
+		URL    string `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	sp, err := s.deps.Shop.Transition(r.Context(), shop.TransitionInput{
+		ShopID: r.PathValue("id"), To: body.To, Reason: body.Reason,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sp)
+}
+
+func (s *Server) handleShopGroup(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:update", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		Group string   `json:"group"`
+		Tags  []string `json:"tags"`
+		URL   string   `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	sp, err := s.deps.Shop.SetGroup(r.Context(), shop.SetGroupInput{
+		ShopID: r.PathValue("id"), Group: body.Group, Tags: body.Tags,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sp)
+}
+
+func (s *Server) handleShopTrash(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "shop:read", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	list, total, err := s.deps.Shop.Trash(r.Context(), p.TenantID, queryInt(r, "limit", 50), queryInt(r, "offset", 0))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list, "total": total})
+}
+
+func (s *Server) handleShopRestore(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:update", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	sp, err := s.deps.Shop.Restore(r.Context(), r.PathValue("id"), p2subject(p, subj), terminalFrom(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sp)
+}
+
+func (s *Server) handleEnvCreate(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:create", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Country  string `json:"country"`
+		OSFamily string `json:"os"`
+		DeviceID string `json:"device_id"`
+		URL      string `json:"url"`
+	}
+	_ = decodeJSON(r, &body)
+	env, plan, err := s.deps.Environments.CreateEnv(r.Context(), shop.CreateEnvInput{
+		ShopID: r.PathValue("id"), Country: body.Country, OSFamily: body.OSFamily,
+		DeviceID: body.DeviceID, Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"environment": env,
+		// L4：注入计划不含任何凭证；script 供客户端在文档创建前注入
+		"plan": map[string]any{
+			"env_id": plan.EnvID, "baseline_hash": plan.BaselineHash,
+			"kernel_major": plan.KernelMajor, "tls": plan.TLSSpec,
+			"script_bytes": len(plan.Script),
+		},
+	})
+}
+
+func (s *Server) handleEnvGet(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "env:check", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	env, err := s.deps.Environments.Get(r.Context(), p.TenantID, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+// handleEnvLaunch 下发环境启动单：客户端据此开「隔离窗口」（UA + 注入脚本 + 代理端口 + 内核基线）。
+// 客户端不得自行随机化任何字段（L2 致命项）；响应不含任何凭证（L4）。
+func (s *Server) handleEnvLaunch(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:launch", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		OpenURL string `json:"open_url"`
+	}
+	_ = decodeJSON(r, &body)
+	spec, err := s.deps.Environments.Launch(r.Context(), shop.LaunchInput{
+		ShopID: r.PathValue("id"), OpenURL: body.OpenURL,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, spec)
+}
+
+func (s *Server) handleEnvCheck(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "env:check", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	var body map[string]string
+	_ = decodeJSON(r, &body)
+	report, err := s.deps.Environments.Check(r.Context(), p.TenantID, r.PathValue("id"), body)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// ---------- 账密托管 ----------
+
+func (s *Server) handleCredPut(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:credential.manage", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Vault == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Kind     string `json:"kind"`
+		Username string `json:"username"`
+		Secret   string `json:"secret"`
+		URL      string `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	if err := s.deps.Vault.Put(r.Context(), shop.PutInput{
+		ShopID: r.PathValue("id"), Kind: types.CredentialKind(body.Kind),
+		Username: body.Username, Secret: body.Secret,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCredList(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "shop:credential.manage", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Vault == nil {
+		s.notWired(w)
+		return
+	}
+	kinds, err := s.deps.Vault.ListKinds(r.Context(), p.TenantID, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"kinds": kinds})
+}
+
+// handleCredReveal 查看凭证明文：需 shop:credential.reveal（Approval 义务 + 高危告警）。
+func (s *Server) handleCredReveal(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:credential.reveal", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Vault == nil {
+		s.notWired(w)
+		return
+	}
+	// 凭证明文属于高危动作：必须携带已通过的审批单（反例 8 + L4）
+	ticketID := r.URL.Query().Get("ticket")
+	if s.deps.Approvals != nil && s.deps.Approvals.Required(types.ApprovalTypeCredReveal) {
+		ticket, err := s.deps.Approvals.Verify(r.Context(), p.TenantID, ticketID,
+			types.ApprovalTypeCredReveal, subj.UserID)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		ticketID = ticket.ID
+	}
+	plain, err := s.deps.Vault.Reveal(r.Context(), shop.RevealInput{
+		ShopID: r.PathValue("id"), Kind: types.CredentialKind(r.PathValue("kind")),
+		Reason: r.URL.Query().Get("reason"), ApprovalID: ticketID,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// 一次性核销：一张审批单只能看一次明文
+	if s.deps.Approvals != nil && ticketID != "" {
+		_ = s.deps.Approvals.Consume(r.Context(), p.TenantID, ticketID, p2subject(p, subj), terminalFrom(r))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"secret": plain})
+}
+
+// ---------- 安全中心 ----------
+
+func (s *Server) handlePolicyList(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "security:policy.read", "/security")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Security == nil {
+		s.notWired(w)
+		return
+	}
+	list, err := s.deps.Security.List(r.Context(), p.TenantID, r.URL.Query().Get("scope"), r.URL.Query().Get("scope_id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list})
+}
+
+func (s *Server) handlePolicyTemplates(w http.ResponseWriter, r *http.Request) {
+	if _, _, _, err := s.authorize(r, "security:policy.read", "/security"); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": security.Templates()})
+}
+
+func (s *Server) handlePolicyUpsert(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "security:policy.manage", "/security")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Security == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		Name     string             `json:"name"`
+		Scope    string             `json:"scope"`
+		ScopeID  string             `json:"scope_id"`
+		Template string             `json:"template"`
+		Enabled  *bool              `json:"enabled"`
+		Rules    []types.PolicyRule `json:"rules"`
+		URL      string             `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	enabled := true
+	if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	pol, err := s.deps.Security.Upsert(r.Context(), security.UpsertInput{
+		ID: r.PathValue("id"), Name: body.Name, Scope: body.Scope, ScopeID: body.ScopeID,
+		Template: body.Template, Enabled: enabled, Rules: body.Rules,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, pol)
+}
+
+func (s *Server) handlePolicyDelete(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "security:policy.manage", "/security")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Security == nil {
+		s.notWired(w)
+		return
+	}
+	if err := s.deps.Security.Delete(r.Context(), p.TenantID, r.PathValue("id"), p2subject(p, subj), terminalFrom(r)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
+	p, _, _, err := s.authorize(r, "security:event.read", "/security")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Security == nil {
+		s.notWired(w)
+		return
+	}
+	f := store.SecurityEventFilter{
+		Category: r.URL.Query().Get("category"), Level: r.URL.Query().Get("level"),
+		ShopID: r.URL.Query().Get("shop_id"),
+		Limit:  queryInt(r, "limit", 50), Offset: queryInt(r, "offset", 0),
+	}
+	list, total, err := s.deps.Security.ListEvents(r.Context(), p.TenantID, f)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list, "total": total})
+}
+
+// handleIntercept 事前拦截判定（客户端在访问页面/点击元素/执行动作前调用）。
+func (s *Server) handleIntercept(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "shop:read", "/security")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Security == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		ShopID  string `json:"shop_id"`
+		URL     string `json:"url"`
+		Action  string `json:"action"`
+		Element string `json:"element"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	res, err := s.deps.Security.Intercept(r.Context(), security.InterceptInput{
+		TenantID: p.TenantID, ShopID: body.ShopID, URL: body.URL,
+		Action: body.Action, Element: body.Element,
+		Actor: p2subject(p, subj), Terminal: terminalFrom(r),
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// ---------- 指纹基线 ----------
+
+func (s *Server) handleTLSBaselines(w http.ResponseWriter, r *http.Request) {
+	if _, _, _, err := s.authorize(r, "env:check", "/shops"); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Baselines == nil {
+		s.notWired(w)
+		return
+	}
+	items := []any{}
+	for _, major := range []int{115, 120, 131} {
+		if bl, ok := s.deps.Baselines.For(major); ok {
+			items = append(items, bl)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items, "baseline_hash": s.deps.Baselines.BaselineHash(),
+		"computed": s.deps.Baselines.Computed(),
+	})
+}
+
+func (s *Server) handleFingerprintLayers(w http.ResponseWriter, r *http.Request) {
+	if _, _, _, err := s.authorize(r, "env:check", "/shops"); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": fingerprint.LayerTable()})
+}
+
+func queryInt(r *http.Request, key string, def int) int {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
