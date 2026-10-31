@@ -8,6 +8,7 @@ import (
 
 	"ziniao/iam"
 	"ziniao/platform/apierr"
+	"ziniao/platform/config"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 )
@@ -112,12 +113,12 @@ func (s *Service) RequiredFor(t *types.ApprovalTicket) Requirement {
 	if t == nil {
 		return Requirement{MinApprovers: 1}
 	}
-	threshold := 0.0
+	// 阈值必须走同一个取值口径：网关判断「要不要持证」用的也是 PurchaseOwnerThresholdCNY。
+	// 若两边口径不一致，会出现「网关放行但单据要求双人签署」或反之——这种错现场看起来
+	// 像随机抽风，实际是配置被读了两次。
+	threshold := config.Default().Limits.PurchaseOwnerThresholdCNY()
 	if s.cfg != nil {
-		threshold = s.cfg.Limits.WithdrawApprovalThresholdCNY
-	}
-	if threshold <= 0 {
-		threshold = 50000
+		threshold = s.cfg.Limits.PurchaseOwnerThresholdCNY()
 	}
 	amount := amountOfTicket(t)
 	for _, r := range rulesOf(threshold) {

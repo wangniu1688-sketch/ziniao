@@ -112,4 +112,6 @@ const (
 	TypeShopDeleted    = "shop.deleted"
 	TypeUsageRecorded  = "usage.recorded"
 	TypeRiskAlert      = "risk.alert"
+	// TypeTempGrantExpired 临时授权到期被回收（定时任务发出，定向通知当事人）。
+	TypeTempGrantExpired = "iam.temp_grant.expired"
 )

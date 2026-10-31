@@ -226,6 +226,9 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*Principal, e
 			continue
 		}
 		// 临时授权：到期自动失效（M12）
+		// 判定依据是 data_grants 里带 expires_at 的记录——所以底层仓储必须把
+		// 过期记录一并返回（含过期），不能提前过滤。这里的 now 判定解决
+		// 「到期即可失效」，物理清理与通知交给 tenant.RevokeExpiredGrants 任务。
 		if ur.TenantID != "" {
 			grants, gErr := s.st.DataGrants().ListByUser(ctx, tenantID, userID, "role")
 			if gErr == nil {

@@ -11,6 +11,7 @@ import (
 	"ziniao/iam"
 	"ziniao/identity"
 	"ziniao/platform/apierr"
+	"ziniao/platform/config"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 	"ziniao/security"
@@ -104,12 +105,9 @@ func (s *Server) purchaseAmountCNY(ctx context.Context, tenantID string, months,
 // 这里刻意区分金额：小额零星申购不该走审批，否则日常操作被流程拖垮，
 // 最后的结果一定是大家想方设法绕过流程。阈值本身是可配置项。
 func (s *Server) purchaseNeedsApproval(ctx context.Context, tenantID string, months, count int) bool {
-	threshold := 0.0
+	threshold := config.Default().Limits.PurchaseOwnerThresholdCNY()
 	if s.deps.Config != nil {
-		threshold = s.deps.Config.Limits.WithdrawApprovalThresholdCNY
-	}
-	if threshold <= 0 {
-		threshold = 50000
+		threshold = s.deps.Config.Limits.PurchaseOwnerThresholdCNY()
 	}
 	return s.purchaseAmountCNY(ctx, tenantID, months, count) >= threshold
 }

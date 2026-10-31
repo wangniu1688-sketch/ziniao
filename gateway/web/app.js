@@ -2,7 +2,11 @@
    角色权限由服务端裁决：无权限的按钮点击会收到 403，前端只做展示分组。 */
 "use strict";
 
-const state = { token: localStorage.getItem("zn_token") || "", me: null };
+// state.selected 批量删除的勾选集合（跨重绘保存），csvDry 存放体检结果。
+const state = {
+  token: localStorage.getItem("zn_token") || "", me: null,
+  selected: new Set(), csvFile: null,
+};
 
 const SECTIONS = [
   { id: "dashboard",     title: "工作台",    roles: null },
@@ -27,10 +31,58 @@ async function api(method, path, body, raw) {
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
   if (res.status === 401) { logout(); throw new Error("登录已过期"); }
   if (!res.ok && !raw) {
-    const msg = (data && (data.message || data.error)) || text || res.status;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    throw mkErr(data, text, res.status);
   }
   return { status: res.status, body: data, text };
+}
+function mkErr(data, text, status) {
+  const msg = (data && (data.message || data.error)) || text || status;
+  const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  // 错误码不能丢：批量删除/申购被拦时是 approval_required，流程要靠它分流，
+  // 光看 message 文案做判断等于把后端契约绑死在中文字符串上。
+  err.code = (data && (data.code || data.error)) || "";
+  err.status = status;
+  return err;
+}
+
+/* 需要二次审批时，服务端统一返回 **202 Accepted + code=approval_required**
+   （apierr.Approval）。202 在 HTTP 语义上不算错误，所以任何用 raw=true 绕开
+   抛错的调用点都必须自己判——否则会出现「下载到一个装着错误 JSON 的 CSV」、
+   「提示已删除 0 家却不说为什么」这类假装成功的界面。 */
+function needsApproval(r) {
+  return r.status === 202 || (r.body && r.body.code === "approval_required");
+}
+function approvalHint(what) {
+  return `${what}被服务端拦下：该操作需二次审批。\n` +
+    `这不是前端灰按钮式的假控制——绕过界面直接调接口同样会被拦。\n` +
+    `请提交审批单，获批后把单号回填重试（单据一次性核销）。`;
+}
+
+/* multipart 上传与带鉴权的下载：前者用于 CSV 导入，后者用于模板下载。
+   这两个都**不能**走上面的 api()：Content-Type 得交给浏览器自动生成边界串，
+   模板下载要转成 Blob，更不能让浏览器直接跳 <a href>（那会漏掉 Bearer 令牌）。*/
+async function uploadFile(path, file, query) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const opt = { method: "POST", headers: {}, body: fd };
+  if (state.token) opt.headers.Authorization = "Bearer " + state.token;
+  const res = await fetch(path + (query || ""), opt);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (res.status === 401) { logout(); throw new Error("登录已过期"); }
+  // 207 = 部分成功，不是失败：脏行要展示给用户，抛成异常等于把明细吞了
+  if (!res.ok && res.status !== 207) throw mkErr(data, text, res.status);
+  return { status: res.status, body: data || {}, text };
+}
+async function downloadAuth(path, filename) {
+  const res = await fetch(path, { headers: { Authorization: "Bearer " + state.token } });
+  if (res.status === 401) { logout(); throw new Error("登录已过期"); }
+  if (!res.ok) throw new Error("下载失败（HTTP " + res.status + "）");
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  URL.revokeObjectURL(a.href);
 }
 const GET = (p) => api("GET", p).then(r => r.body);
 const POST = (p, b) => api("POST", p, b || {});
@@ -127,8 +179,10 @@ async function renderDashboard(c) {
 /* ---------- 店铺 ---------- */
 function shopTable(items, withActions) {
   if (!items.length) return `<p class="muted">暂无数据</p>`;
-  return `<table><tr><th>名称</th><th>平台</th><th>站点</th><th>状态</th><th>分组</th>${withActions ? "<th>操作</th>" : ""}</tr>` +
+  return `<table><tr>${withActions ? "<th></th>" : ""}<th>名称</th><th>平台</th><th>站点</th><th>状态</th><th>分组</th>${withActions ? "<th>操作</th>" : ""}</tr>` +
     items.map(s => `<tr>
+      ${withActions ? `<td><input type="checkbox" class="pick" value="${s.id}" ${state.selected.has(s.id) ? "checked" : ""}
+        onchange="togglePick(this)"><span class="muted small">${esc(s.id.slice(0, 8))}</span></td>` : ""}
       <td>${esc(s.name)}</td><td>${esc(s.platform)}</td><td>${esc(s.site)}</td>
       <td>${badge(s.status)}</td><td>${esc(s.group || "-")}</td>
       ${withActions ? `<td>
@@ -155,10 +209,29 @@ async function renderShops(c) {
         <button class="primary" onclick="createShop()">创建</button>
       </div>
     </div>
-    <div class="card"><h3>批量导入（每行：名称,平台,站点 —— 逐行校验，部分成功返回 207）</h3>
+    <div class="card"><h3>CSV 导入（推荐：先把表格体检一遍，确认没有脏行再落库）</h3>
+      <div class="row">
+        <input id="csv-file" type="file" accept=".csv,text/csv">
+        <button onclick="csvDryRun()">体检（不落库）</button>
+        <button class="primary" id="csv-commit" onclick="csvCommit()" disabled>确认导入</button>
+        <button onclick="downloadTemplate()">下载模板</button>
+      </div>
+      <p class="muted small">表头可有可无、列序任意，容忍 BOM；脏行不牵连整批（不影响其它行入库）。
+        「体检」用后端 dry-run，只做格式与配额自检，一笔数据都不写。</p>
+      <div id="csv-res"></div>
+    </div>
+    <div class="card"><h3>批量粘贴导入（每行：名称,平台,站点 —— 逐行校验，部分成功返回 207）</h3>
       <textarea id="sp-batch" placeholder="店A,Amazon,US&#10;店B,Shopee,MY"></textarea>
       <div class="row" style="margin-top:8px"><button class="primary" onclick="batchImport()">导入</button><span id="sp-batch-res" class="muted small"></span></div>
     </div>
+    <div class="card"><h3>批量删除（须持 shop.bulk_delete 审批单，一次核销；删除后进回收站）</h3>
+      <div class="row">
+        <label>已勾选 <span id="bulk-count">0</span> 家</label>
+        <label>审批单号 <input id="bulk-ticket" placeholder="留空则自动申请" style="width:230px"></label>
+        <button class="danger" onclick="bulkDelete()">批量删除</button>
+        <button onclick="requestBulkDeleteTicket()">申请审批单</button>
+      </div>
+      <pre class="json" id="bulk-out"></pre></div>
     <div class="card"><h3>店铺列表（${shops.total}）</h3>${shopTable(shops.items, true)}</div>
     <div class="card"><h3>回收站（${trash.total}）</h3>
       ${(trash.items || []).length ? `<table><tr><th>名称</th><th>软删时间</th><th>操作</th></tr>` +
@@ -167,6 +240,99 @@ async function renderShops(c) {
           <button class="danger" onclick="purgeShop('${s.id}')">彻底删除</button></td></tr>`).join("") + `</table>`
         : `<p class="muted">空</p>`}
     </div>`;
+  setTimeout(updBulkUI, 0); // 重绘后同步 Header 里的勾选计数
+}
+
+/* ---------- 批量删除（服务端硬拦：须持一次性审批单） ---------- */
+function togglePick(cb) {
+  if (cb.checked) state.selected.add(cb.value); else state.selected.delete(cb.value);
+  updBulkUI();
+}
+function updBulkUI() {
+  const el = document.getElementById("bulk-count");
+  if (el) el.textContent = state.selected.size;
+}
+
+async function requestBulkDeleteTicket() {
+  const out = document.getElementById("bulk-out");
+  const n = state.selected.size;
+  try {
+    const t = await POST("/api/v1/approvals", {
+      type: "shop.bulk_delete", subject_type: "shop",
+      reason: (n ? `批量删除 ${n} 家店铺` : "批量删除店铺（未在列表勾选）"), url: "/shops",
+    });
+    document.getElementById("bulk-ticket").value = t.id;
+    out.textContent = `审批单已提交：${t.id}\n状态：pending\n需另一位有审批权限的成员在「审批工单」页通过；申请人与审批人不能是同一人。\n通过后回到本页执行删除（单据一次性核销）。`;
+    toast("审批单已提交");
+  } catch (e) { out.textContent = "提交审批单失败：" + e.message; toast(e.message, true); }
+}
+
+async function bulkDelete() {
+  const out = document.getElementById("bulk-out");
+  const ids = Array.from(state.selected);
+  if (!ids.length) { toast("先在列表中勾选店铺", true); return; }
+  const ticket = val("bulk-ticket");
+  try {
+    const r = await api("POST", "/api/v1/shops/batch/delete" + (ticket ? "?ticket=" + encodeURIComponent(ticket) : ""),
+      { ids, url: "/shops" }, true);
+    if (needsApproval(r)) {
+      out.textContent = approvalHint("批量删除") + "\n点「申请审批单」提交即可，拿到单号后回填重试。";
+      toast("缺少审批单", true);
+      return;
+    }
+    if (r.status >= 400) throw mkErr(r.body, r.text, r.status);
+    out.textContent = `已删除 ${r.body.deleted ?? 0} 家（共勾选 ${ids.length} 家，软删进回收站）\n审批单已核销：同一张单不能再用第二次。`;
+    state.selected.clear();
+    toast("批量删除完成"); go("shops");
+  } catch (e) { out.textContent = "失败：" + e.message; toast(e.message, true); }
+}
+
+/* ---------- CSV 导入：先体检、再落库 ---------- */
+function failureTable(failures) {
+  if (!failures || !failures.length) return "";
+  return `<table><tr><th>行号</th><th>名称</th><th>原因</th></tr>` +
+    failures.map(f => `<tr><td>${f.row}</td><td>${esc(f.name || "-")}</td><td>${esc(f.reason)}</td></tr>`).join("") + `</table>`;
+}
+function renderCsvResult(prefix, r) {
+  const b = r.body || {};
+  const total = b.total ?? 0, created = b.created ?? 0, failed = b.failed ?? 0;
+  const el = document.getElementById("csv-res");
+  el.innerHTML = `<p>${prefix}总计 ${total} 行，入库 ${created} 行，失败 ${failed} 行` +
+    (r.status === 207 ? ` —— <b>HTTP 207 部分成功</b>，脏行不牵连其它行` : "") + `</p>` +
+    failureTable(b.failures) +
+    `<p class="muted small">失败行必须逐行列出来：静默丢掉一行比整批失败更糟，用户会以为导入完了。</p>`;
+  const btn = document.getElementById("csv-commit");
+  if (btn) btn.disabled = !(total - failed > 0);
+}
+async function csvDryRun() {
+  const file = document.getElementById("csv-file").files[0];
+  if (!file) { toast("先选择 CSV 文件", true); return; }
+  state.csvFile = file;
+  try {
+    const r = await uploadFile("/api/v1/shops/batch/import", file, "?dry_run=1");
+    renderCsvResult("体检结果：", r);
+    toast("体检完成，未写入任何数据");
+  } catch (e) {
+    document.getElementById("csv-res").textContent = "体检失败：" + e.message;
+    toast(e.message, true);
+  }
+}
+async function csvCommit() {
+  const file = state.csvFile || document.getElementById("csv-file").files[0];
+  if (!file) { toast("先体检再导入", true); return; }
+  try {
+    const r = await uploadFile("/api/v1/shops/batch/import", file, "");
+    renderCsvResult("导入结果：", r);
+    toast(r.status === 207 ? "部分成功，脏行见下表" : "导入完成");
+    go("shops");
+  } catch (e) {
+    document.getElementById("csv-res").textContent = "导入失败：" + e.message;
+    toast(e.message, true);
+  }
+}
+async function downloadTemplate() {
+  try { await downloadAuth("/api/v1/shops/batch/template", "shop-import-template.csv"); toast("模板已下载"); }
+  catch (e) { toast(e.message, true); }
 }
 async function createShop() {
   try {
@@ -240,6 +406,13 @@ async function credReveal(id) {
       return;
     }
     const r = await api("GET", `/api/v1/shops/${id}/credentials/${kind}?reason=${encodeURIComponent(reason)}&ticket=${encodeURIComponent(ticket)}`, undefined, true);
+    // 单据缺失/过期返回的也是 202 + approval_required，不判的话界面会把错误 JSON
+    // 当成"明文"显示给用户，看起来像取到了一串牌子版的乱码。
+    if (needsApproval(r)) {
+      out.textContent = approvalHint("查看凭证明文") + "\n（若单据已核销或过期，请清空单号重新申请）";
+      toast("需要审批单", true);
+      return;
+    }
     out.textContent = "明文：" + (r.body.secret ?? JSON.stringify(r.body));
     toast("查看成功（审批单已核销）");
   } catch (e) {
@@ -311,8 +484,15 @@ async function renderDevices(c) {
         <label>国家 <input id="dv-country" value="US" style="width:60px"></label>
         <label>地区 <input id="dv-region" placeholder="California"></label>
         <label>周期(月) <input id="dv-months" type="number" value="1" style="width:70px"></label>
+        <label>台数 <input id="dv-count" type="number" value="1" style="width:70px"></label>
+        <label>审批单号 <input id="dv-ticket" placeholder="大额申购需双人复核单据" style="width:240px"></label>
         <button class="primary" onclick="purchaseDevice()">购买</button>
-      </div></div>
+        <button onclick="requestPurchaseTicket()">申请申购审批单</button>
+      </div>
+      <pre class="json" id="dv-out"></pre>
+      <p class="muted small">金额由服务端按套餐单价 × 月数 × 台数重算（客户端报的不算数），
+        超过阈值必须由两位老板签署单据（双人复核）。因此这里<b>不用填金额</b>，
+        只填数量；只要带了单据就一律校验，已核销/被拒的单据混不过去。</p></div>
     <div class="card"><h3>绑定到店铺（配额模型：一台设备可绑多账号，并发按人去重）</h3>
       <div class="row">
         <label>设备 <select id="dv-id">${(devices.items || []).map(d => `<option value="${d.id}">${esc(d.name)}</option>`).join("")}</select></label>
@@ -329,14 +509,48 @@ async function renderDevices(c) {
         : `<p class="muted">暂无设备</p>`}</div>`;
 }
 const dvId = () => val("dv-id");
-async function purchaseDevice() {
+
+// requestPurchaseTicket 申请申购单据：只报月数与台数，金额由服务端按套餐单价算。
+// 之所以不让人填金额，是因为审批要不要双人复核是按金额路由的——由申请人自己
+// 报价等于让他决定自己要不要被复核。
+async function requestPurchaseTicket() {
+  const out = document.getElementById("dv-out");
+  const months = Number(val("dv-months") || 1), count = Number(val("dv-count") || 1);
   try {
-    await POST("/api/v1/devices/purchase", {
-      name: val("dv-name"), type: "cloud", country: val("dv-country"), region: val("dv-region"),
-      period_months: Number(val("dv-months") || 1), url: "/devices",
+    const t = await POST("/api/v1/approvals", {
+      type: "device.purchase", subject_type: "device",
+      reason: `申购 ${count} 台 × ${months} 个月`,
+      detail: { months, count }, url: "/devices",
     });
+    document.getElementById("dv-ticket").value = t.id;
+    out.textContent = `审批单已提交：${t.id}\n状态：pending\n` +
+      `金额已由服务端按套餐单价重算并写入单据（客户端报的不算数）。\n` +
+      `小额由主管批即可；达到阈值时须两位 boss 签署（双人复核），且本人不能批自己的单。`;
+    toast("申购审批单已提交");
+  } catch (e) { out.textContent = "提交审批单失败：" + e.message; toast(e.message, true); }
+}
+
+async function purchaseDevice() {
+  const out = document.getElementById("dv-out");
+  const ticket = val("dv-ticket");
+  const body = {
+    name: val("dv-name"), type: "cloud", country: val("dv-country"), region: val("dv-region"),
+    period_months: Number(val("dv-months") || 1), count: Number(val("dv-count") || 1), url: "/devices",
+  };
+  try {
+    const r = await api("POST", "/api/v1/devices/purchase" + (ticket ? "?ticket=" + encodeURIComponent(ticket) : ""), body, true);
+    if (needsApproval(r)) {
+      out.textContent = approvalHint("本次申购") + "\n" +
+        "金额已达双人复核阈值，须持 device.purchase 单据（两位 boss 签署）。\n" +
+        "点「申请申购审批单」（金额由服务端算），获批后回填单号重试。";
+      toast("需要申购审批单", true);
+      return;
+    }
+    // 金额不足 / 单据已核销 / 被拒：同一个闸门的不同出口，文案照抄服务端
+    if (r.status >= 400) throw mkErr(r.body, r.text, r.status);
+    out.textContent = ticket ? "申购已完成，审批单已核销。" : "申购已完成（未达审批阈值）。";
     toast("设备已购入"); go("devices");
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { out.textContent = "申购失败：" + e.message; toast(e.message, true); }
 }
 async function bindDevice() { try { await POST(`/api/v1/devices/${dvId()}/bind`, { shop_id: val("dv-shop"), url: "/devices" }); toast("已绑定"); go("devices"); } catch (e) { toast(e.message, true); } }
 async function releaseDevice() { try { await POST(`/api/v1/devices/${dvId()}/release`, { url: "/devices" }); toast("已释放"); go("devices"); } catch (e) { toast(e.message, true); } }
@@ -410,6 +624,13 @@ async function exportAudit() {
       return;
     }
     const r = await api("GET", `/api/v1/audit/logs/export?ticket=${encodeURIComponent(ticket)}`, undefined, true);
+    // 最恶劣的一种假装成功：不判 202 的话，会把 {"code":"approval_required"}
+    // 当 CSV 下载下来——文件名是 audit-export.csv，内容却是错误 JSON。
+    if (needsApproval(r)) {
+      out.textContent = approvalHint("审计明文导出");
+      toast("需要审批单", true);
+      return;
+    }
     const blob = new Blob([r.text], { type: "text/csv" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = "audit-export.csv"; a.click();

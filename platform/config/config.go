@@ -38,6 +38,12 @@ type Limits struct {
 	WithdrawApprovalThresholdCNY  float64 `key:"finance.withdraw_approval_threshold_cny"`
 	WithdrawWhitelistCooldownH    int     `key:"finance.withdraw_cooldown_hours"` // 24
 
+	// 设备申购会签阈值（Phase 2 / 双人复核）
+	// 不要复用上面的提现阈值：提现和设备申购是两种完全不同的资金动作，
+	// 共用一个数值意味着调整财务风控会**静默地**改变双人复核的触发线。
+	// 取值一律走 PurchaseOwnerThresholdCNY()，不要在业务代码里读裸字段。
+	DevicePurchaseOwnerThresholdCNY float64 `key:"device.purchase_owner_threshold_cny"`
+
 	// 身份与登录保护（M12 / M14）
 	PasswordMinLen        int           `key:"auth.password_min_len"`
 	MaxFailedLogins       int           `key:"auth.max_failed_logins"`
@@ -116,17 +122,19 @@ func Default() *Config {
 			CurrencySnapshotRetentionDays: 180, // 规格明确值
 			WithdrawApprovalThresholdCNY:  50000,
 			WithdrawWhitelistCooldownH:    24,
-			PasswordMinLen:                10,
-			MaxFailedLogins:               5,
-			LockoutDuration:               15 * time.Minute,
-			AccessTokenTTL:                8 * time.Hour,
-			SessionIdleTimeout:            30 * time.Minute,
-			LoginAllowedStartHour:         0,
-			LoginAllowedEndHour:           24,
-			AgentConfirmTTLSeconds:        1800,
-			AgentAlwaysConfirmOps:         []string{"withdraw", "price_change", "bulk_delete", "account_change"},
-			TempGrantMaxDays:              30,
-			ApprovalTTLSeconds:            1800,
+			// 设备申购双人复核阈值：与提现阈值取同一默认值，但必须能各自调整
+			DevicePurchaseOwnerThresholdCNY: defaultPurchaseOwnerThresholdCNY,
+			PasswordMinLen:                  10,
+			MaxFailedLogins:                 5,
+			LockoutDuration:                 15 * time.Minute,
+			AccessTokenTTL:                  8 * time.Hour,
+			SessionIdleTimeout:              30 * time.Minute,
+			LoginAllowedStartHour:           0,
+			LoginAllowedEndHour:             24,
+			AgentConfirmTTLSeconds:          1800,
+			AgentAlwaysConfirmOps:           []string{"withdraw", "price_change", "bulk_delete", "account_change"},
+			TempGrantMaxDays:                30,
+			ApprovalTTLSeconds:              1800,
 			ApprovalRequiredActions: []string{
 				"audit.export.plain", "shop.credential.reveal", "shop.bulk_delete",
 			},
@@ -161,7 +169,23 @@ func Load() *Config {
 	l.AuditRetentionDaysDefault = envInt("ZINIAO_LIMIT_AUDIT_RETENTION_DAYS", l.AuditRetentionDaysDefault)
 	l.ExportMaxRows = envInt("ZINIAO_LIMIT_EXPORT_MAX_ROWS", l.ExportMaxRows)
 	l.APIRatePerMinute = envInt("ZINIAO_LIMIT_API_RATE_PER_MINUTE", l.APIRatePerMinute)
+	l.DevicePurchaseOwnerThresholdCNY = envFloat("ZINIAO_LIMIT_DEVICE_PURCHASE_THRESHOLD_CNY", l.DevicePurchaseOwnerThresholdCNY)
 	return c
+}
+
+// defaultPurchaseOwnerThresholdCNY 设备申购双人复核阈值的内置兜底值（元）。
+const defaultPurchaseOwnerThresholdCNY = 50000
+
+// PurchaseOwnerThresholdCNY 设备申购达到多大金额就要求两位 owner 会签（元）。
+//
+// 这是**唯一**的取值口径。此前 approval 的路由规则与网关的申购闸门各自读一遍
+// 配置、各自兜底 50000，属于典型的「两边口径不一致」——改了配置只有一半生效，
+// 而单测两边都过（又是一个 mem 与 pg 那种只在生产中相遇的缺陷）。
+func (l Limits) PurchaseOwnerThresholdCNY() float64 {
+	if l.DevicePurchaseOwnerThresholdCNY > 0 {
+		return l.DevicePurchaseOwnerThresholdCNY
+	}
+	return defaultPurchaseOwnerThresholdCNY
 }
 
 // PlanCatalog 套餐矩阵（M20 运营后台可配置，此处为内置默认值）。
@@ -234,6 +258,15 @@ func envDur(k string, def time.Duration) time.Duration {
 	if v := os.Getenv(k); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

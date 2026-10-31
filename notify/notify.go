@@ -68,7 +68,7 @@ func (s *Sink) Name() string { return "notify" }
 
 // Types 订阅范围：风险类、部分 IAM 事件，以及**审批待办**（TODO 第 6 条）。
 func (s *Sink) Types() []string {
-	return []string{"risk.", "auth.login_failed", "shop.deleted", "iam.role.", "usage.recorded", "iam.approval."}
+	return []string{"risk.", "auth.login_failed", "shop.deleted", "iam.role.", "iam.temp_grant.", "usage.recorded", "iam.approval."}
 }
 
 // Handle 生成站内通知并外发到已启用通道。

@@ -568,6 +568,8 @@ func (r grantRepo) Create(ctx context.Context, g *types.DataGrant) error {
 	})
 }
 
+// ListByUser 返回全部授权记录（含已过期），与 mem 实现口径一致。
+// 原因见 mem 同名方法：过滤过期行会让身份层的「临时授权到期失效」判定失去依据。
 func (r grantRepo) ListByUser(ctx context.Context, tenantID, userID, resourceType string) ([]types.DataGrant, error) {
 	out := []types.DataGrant{}
 	err := r.run(ctx, func(q querier) error {
@@ -578,8 +580,35 @@ func (r grantRepo) ListByUser(ctx context.Context, tenantID, userID, resourceTyp
 			sql += ` AND resource_type=$3`
 			args = append(args, resourceType)
 		}
-		sql += ` AND (expires_at IS NULL OR expires_at > now())`
 		rows, err := q.Query(ctx, sql, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g types.DataGrant
+			if err := rows.Scan(&g.ID, &g.TenantID, &g.UserID, &g.ResourceType, &g.ResourceID,
+				&g.Scope, &g.GrantedBy, &g.ExpiresAt, &g.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, g)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+// DeleteExpired 用 RETURNING 一次拿回被删条目：
+// 先 SELECT 再 DELETE 在并发下会读到已经不存在的行，也会让回收与发通知之间
+// 出现窗口（清了行但通知没发出去，等于静默收权）。
+func (r grantRepo) DeleteExpired(ctx context.Context, tenantID string, now time.Time) ([]types.DataGrant, error) {
+	out := []types.DataGrant{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `DELETE FROM data_grants
+			WHERE tenant_id=$1 AND expires_at IS NOT NULL AND expires_at <= $2
+			RETURNING id,tenant_id,user_id,resource_type,COALESCE(resource_id,''),
+				COALESCE(scope,''),COALESCE(granted_by,''),expires_at,created_at`,
+			tenantID, now.UTC())
 		if err != nil {
 			return err
 		}

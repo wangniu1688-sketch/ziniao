@@ -118,6 +118,19 @@
   - `POST /api/v1/devices/purchase`：新增 `count` 支持批量申购，金额由服务端按
     套餐单价 × 月数 × 台数重算（**不能听客户端报**），超阈值必须持证；
     客户端只要带了单据就一律校验，防止拿已核销/已拒绝的单据混过去。
+- **补齐控制台界面（本轮）**：以上 API 此前没有对应界面，只有 curl 能用：
+  - 店铺页：勾选 ≡ 批量删除，无证立刻被告知缺 `shop.bulk_delete` 单据并可一键申请；
+  - 设备页：申购填**台数**不填金额，超阈值提示需双人复核单据。
+- **金额一律不信客户端报价（本轮）**：审批单的 `detail.amount` 此前直接采信报文，
+  于是"申购 198 台（5 万+）把 amount 写成 100"就能走单人审批，双人复核形同虚设。
+  现由 `overridePurchaseDetail` 按套餐单价重算并覆盖，与申购接口共用同一口径。
+- **阈值不再借用财务（本轮）**：此前 `approval/router.go` 与 `gateway/phase1.go`
+  各自读 `finance.withdraw_approval_threshold_cny` 并各自兜底 50000 —— 典型的
+  「两边口径不一致」，改配置只有一半生效，而两边单测都过（与 PG 那次同类）。
+  现统一走 `Limits.PurchaseOwnerThresholdCNY()`（默认值仍 50000，真实值由运营定）。
+- **202 不是成功（本轮，调用方规范）**：所有审批闸门返回 HTTP **202 +
+  `code=approval_required`**（`apierr.Approval`）。谁把它当 2xx 放行，谁就会拿到
+  「下载了一个装着错误 JSON 的 audit-export.csv」。前端统一由 `needsApproval()` 判别。
 - **仍缺**：代理机构委托审批，需 `approval_flows` 表承载，属运营后台范围。
 
 ## 6. ~~审批工单的「待办通知」~~ → ✅ 已实现（notify Sink 定向推送）
@@ -172,4 +185,24 @@
 | M19 | Agent 人工确认闸门 | `AgentConfirmTTLSeconds` 已登记，执行器未接 |
 | — | 事件总线 Kafka 传输层 | 当前进程内派发 |
 | — | argon2id 替换 PBKDF2 | 待引入 `golang.org/x/crypto` |
-| — | 临时授权到期自动回收（定时任务） | 数据模型已支持，任务未注册 |
+
+## 10. ~~临时授权到期自动回收~~ → ✅ 已注册为定时任务（本轮）
+
+- **分工**：到期**即刻失效**由读路径负责（`identity` 拿着 `expires_at` 现场判定，
+  不等定时任务，否则会留下最长一个执行周期的裸奔窗口）；
+  `iam.temp_grant_revoke`（30m）负责**清行 + 连带撤销 `user_roles` + 定向通知本人**。
+- **本轮撞出的连带缺陷**：`DataGrantRepo.ListByUser` 在 SQL/内存层把过期行提前过滤了，
+  而 `identity` 判断「角色是否因临时授权到期而失效」恰恰依赖这些过期记录存在 ——
+  两者相消的结果是**临时授权到期后权限照旧**。现在仓储返回全量，过期判定由策略层做。
+- **mem 踩坑记录**：给 `grantRepo` 的方法自行加锁会当场死锁——`mem.WithTx` 已经持有
+  同一把不可重入的 `sync.Mutex`，仓储层不负责并发控制（曾导致测试卡 10 分钟超时）。
+- **PG 16.15 实跑已验证（本轮）**：手工构造三种输入跑 `iam.temp_grant_revoke`——
+  ① 到期临时角色（连带撤销 `user_roles`）② 到期但同角色另有正式授权（正式角色**保留**）
+  ③ 未到期/正式授权（一行未动）。`affected=2`、两条定向给当事人的通知入库，
+  实跑数据随后已清理。`DELETE ... RETURNING` 这条 SQL 此前从未在真库上跑过，
+  mem 全绿不代表它对。
+- **已知限制**：`user_roles` 上 `(tenant_id,user_id,role_id)` 唯一约束，导致同一人的
+  「正式」与「临时」授权共用一行；回收时靠比对 `granted_at` 与授权 `created_at`
+  决定是否连带撤销，属间接证据。根治需给 `user_roles` 增加 `source` 列
+  （`permanent`/`temporary`），届时改为显式字段判断。测试
+  `TestRevokeKeepsEarlierPermanentRole` 锁住了这条判据。

@@ -2,6 +2,7 @@ package jobs_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -48,6 +49,21 @@ func (f *fakePurger) PurgeExpired(_ context.Context, _ string, days int) (int, e
 type fakeSweeper struct{ n int }
 
 func (f *fakeSweeper) ExpireSweep(_ context.Context, _ string, _ time.Time) (int, error) {
+	return f.n, nil
+}
+
+type fakeReaper struct {
+	n      int
+	tenant string
+	at     time.Time
+	err    error
+}
+
+func (f *fakeReaper) RevokeExpired(_ context.Context, tenantID string, now time.Time) (int, error) {
+	f.tenant, f.at = tenantID, now
+	if f.err != nil {
+		return 0, f.err
+	}
 	return f.n, nil
 }
 
@@ -107,23 +123,28 @@ func TestThrottle(t *testing.T) {
 	}
 }
 
-// TestAllJobsRun 三个任务都能在调度器里被跑到，且结果带任务名与租户。
+// TestAllJobsRun 四个任务都能在调度器里被跑到，且结果带任务名与租户。
 func TestAllJobsRun(t *testing.T) {
 	sched := jobs.NewScheduler(fakeTenants{list: []jobs.TenantRef{{ID: "t1"}, {ID: "t2"}}}, slog.Default())
 	purger := &fakePurger{n: 2}
 	sweeper := &fakeSweeper{n: 1}
+	reaper := &fakeReaper{n: 3}
 	sched.Register(
 		jobs.NewDeviceInspector(&fakeDevices{}, nil, 7, 60),
 		jobs.NewShopPurger(purger, 30),
 		jobs.NewApprovalJanitor(sweeper),
+		jobs.NewTempGrantJanitor(reaper),
 	)
 	names := sched.Names()
-	if len(names) != 3 {
-		t.Fatalf("应注册 3 个任务，实际 %v", names)
+	if len(names) != 4 {
+		t.Fatalf("应注册 4 个任务，实际 %v", names)
 	}
 	results := sched.RunOnce(context.Background())
-	if len(results) != 6 { // 3 任务 × 2 租户
-		t.Fatalf("应产生 6 条结果，实际 %d", len(results))
+	if len(results) != 8 { // 4 任务 × 2 租户
+		t.Fatalf("应产生 8 条结果，实际 %d", len(results))
+	}
+	if reaper.tenant == "" {
+		t.Fatalf("回收任务应拿到租户 ID")
 	}
 	if purger.days != 30 {
 		t.Fatalf("留存期应透传，实际 %d", purger.days)
@@ -135,7 +156,7 @@ func TestAllJobsRun(t *testing.T) {
 	}
 }
 
-// TestIntervals 任务周期符合预期（巡检 6h / 清理 24h / 审批过期 10m）。
+// TestIntervals 任务周期符合预期（巡检 6h / 清理 24h / 审批过期 10m / 临时授权回收 30m）。
 func TestIntervals(t *testing.T) {
 	cases := []struct {
 		job  jobs.Job
@@ -144,10 +165,47 @@ func TestIntervals(t *testing.T) {
 		{jobs.NewDeviceInspector(&fakeDevices{}, nil, 7, 60), 6 * time.Hour},
 		{jobs.NewShopPurger(&fakePurger{}, 30), 24 * time.Hour},
 		{jobs.NewApprovalJanitor(&fakeSweeper{}), 10 * time.Minute},
+		{jobs.NewTempGrantJanitor(&fakeReaper{}), 30 * time.Minute},
 	}
 	for _, tc := range cases {
 		if got := tc.job.Interval(); got != tc.want {
 			t.Fatalf("%s 周期应为 %s，实际 %s", tc.job.Name(), tc.want, got)
 		}
+	}
+}
+
+// TestTempGrantJanitorReportsPerTenant 回收任务按租户分别上报，并把当前时间透传给依赖
+// （以期为依据，避免各模块各取一次 now 造成"同一批扫描里有两条不同的当前时间"）。
+func TestTempGrantJanitorReportsPerTenant(t *testing.T) {
+	reaper := &fakeReaper{n: 2}
+	job := jobs.NewTempGrantJanitor(reaper)
+	now := time.Now().UTC().Truncate(time.Second)
+	res := job.Run(context.Background(), jobs.Context{
+		Tenants: []jobs.TenantRef{{ID: "t1"}, {ID: "t2"}}, Now: now,
+	})
+	if len(res) != 2 {
+		t.Fatalf("应按租户返回 2 条结果，实际 %+v", res)
+	}
+	for _, r := range res {
+		if r.Affected != 2 || r.Err != "" {
+			t.Fatalf("回收数应透传: %+v", r)
+		}
+		if r.Job != "iam.temp_grant_revoke" || r.TenantID == "" {
+			t.Fatalf("结果缺少任务名/租户: %+v", r)
+		}
+	}
+	if !reaper.at.Equal(now) {
+		t.Fatalf("Now 应透传给依赖，实际 %v", reaper.at)
+	}
+}
+
+// TestTempGrantJanitorErrorCarried 依赖报错必须落到 Result.Err 而不是让整个 Run panic
+// （一个租户失败不能把它兄弟租户的结果也带走）。
+func TestTempGrantJanitorErrorCarried(t *testing.T) {
+	reaper := &fakeReaper{err: errors.New("db down")}
+	job := jobs.NewTempGrantJanitor(reaper)
+	res := job.Run(context.Background(), jobs.Context{Tenants: []jobs.TenantRef{{ID: "t1"}}, Now: time.Now()})
+	if len(res) != 1 || res[0].Err == "" {
+		t.Fatalf("错误应写入 Result.Err: %+v", res)
 	}
 }

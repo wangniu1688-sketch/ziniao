@@ -105,6 +105,12 @@ type UserRoleRepo interface {
 type DataGrantRepo interface {
 	Create(ctx context.Context, g *types.DataGrant) error
 	ListByUser(ctx context.Context, tenantID, userID, resourceType string) ([]types.DataGrant, error)
+	// DeleteExpired 物理删除已到期的临时授权，并返回被删除的条目。
+	//
+	// 返回被删条目不是可选的花架子：回收任务要给当事人发通知、要在审计里写清
+	// 楚「谁的什么权限被回收了」。只返回个计数，通知就变成了「你的某个权限没了」。
+	// 未到期（ExpiresAt 为 NULL）的正式授权绝不能被这条语句碰到。
+	DeleteExpired(ctx context.Context, tenantID string, now time.Time) ([]types.DataGrant, error)
 }
 
 type SessionRepo interface {

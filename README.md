@@ -137,6 +137,7 @@ docs/              ADR、权限矩阵、计费规则、未实现项清单
 | `ZINIAO_LIMIT_DEVICE_CONCURRENT_USERS` | `6` | 设备同时使用人数软阈值 |
 | `ZINIAO_LIMIT_AUDIT_RETENTION_DAYS` | `180` | 浏览类审计留存 |
 | `ZINIAO_LIMIT_EXPORT_MAX_ROWS` | `50000` | 导出行上限 |
+| `ZINIAO_LIMIT_DEVICE_PURCHASE_THRESHOLD_CNY` | `50000` | 设备申购双人复核阈值（元），见 9.5 |
 
 ---
 
@@ -230,9 +231,9 @@ cipher.Rekey(enc)   // 密钥轮换：只换封皮，明文不动
 | 菜单 | 能力 |
 |---|---|
 | 工作台 | 店铺/设备/待审批/安全事件统计 + 审计哈希链校验 |
-| 店铺管理 | 建店、状态机迁移、回收站/恢复/彻底删除、**批量导入（207 部分成功）**、凭证托管（写密文 + 审批后看明文） |
+| 店铺管理 | 建店、状态机迁移、回收站/恢复/彻底删除、**CSV 上传（先体检后导入）**、批量粘贴导入（207 部分成功）、**勾选批量删除（须审批单）**、凭证托管（写密文 + 审批后看明文） |
 | 审批工单 | 提交 / 通过 / 拒绝 / 撤销，自己批自己会被 403（职责分离） |
-| 设备与网络 | 购买云网络设备、绑定店铺（配额模型）、续费 |
+| 设备与网络 | 购买云网络设备（按台数，金额服务端算；大额须双人复核单据）、绑定店铺（配额模型）、续费 |
 | 安全中心 | 策略模板一键套用、安全事件追溯 |
 | 审计日志 | 查询、哈希链校验、**带水印 CSV 导出（审批联动）** |
 | 团队与成员 | 邀请成员、授予角色、权限矩阵 |
@@ -277,6 +278,7 @@ id,category,actor,action,result,shop_id,ip,url,occurred_at,hash
 | `device.inspect` | 6h | 临期（≤7d）high 告警 + 健康分 <60 medium 告警 |
 | `shop.trash_purge` | 24h | 回收站超留存期（30d）彻底删除 |
 | `approval.expire` | 10m | 超时未决审批单置为 `expired` |
+| `iam.temp_grant_revoke` | 30m | 到期的临时授权清出库 + 定向通知当事人 |
 
 任务以 `system` 身份写审计，`Terminal.Mode=job` 标记来源；`POST /api/v1/jobs/run`
 可手动触发（不必等定时），`Jobs` 按 `Interval` 节流避免重复告警。
@@ -303,6 +305,37 @@ POST /api/v1/shops/batch/import              → 逐行走权限 + 配额 + 审�
 **删除**（`POST /api/v1/shops/batch/delete`）：一次勾删几十家时人工逐个确认已失去意义，
 能真正拦住误操作的是**事前那张审批单**——须持已通过的 `shop.bulk_delete` 单据，
 执行后单据即核销，一张单不能清两次库。
+
+> **调用方注意（前端尤其容易踩）**：所有审批闸门返回的都是 **HTTP 202 +
+> `code=approval_required`**（见 `apierr.Approval`）。202 在 HTTP 语义上不是错误，
+> 谁把它当 2xx 放行，谁就会拿到"下载了一个装着错误 JSON 的 audit-export.csv"、
+> "提示已删除 0 家却不说明被拦"。前端统一用 `needsApproval(res)` 判这一路。
+
+### 9.5 分期回落：临时授权到期（M12）
+
+**金额一类的数字一律不信客户端报价**，两处都得服务端自己算：
+
+| 位置 | 以前（错） | 现在 |
+|---|---|---|
+| 单据金额 | 采信 `detail.amount`，申购 198 台写 100 元就能走单人审批 | `overridePurchaseDetail` 按套餐单价重算并覆盖 |
+| 申购金额 | 已由服务端算（上一轮修） | 与审批口径共用 `purchaseAmountCNY` |
+
+阈值由独立配置项 `device.purchase_owner_threshold_cny`（默认 50000 元）控制，
+此前提早是借用财务的提现阈值——改财务风控会静默改掉双人复核线。
+取值只有 `Limits.PurchaseOwnerThresholdCNY()` 一个入口。
+
+临时授权到期分两步，缺一不可：
+
+- **读路径**：`identity` 拿着 `expires_at` 现场判定，到期即刻失效，不等定时任务；
+  因此底层仓储必须把过期记录一并返回（`DataGrantRepo` 曾经在 SQL 里先过滤掉它们，
+  结果上层永远看不到，临时授权到期后权限照旧）。
+- **写路径**：`iam.temp_grant_revoke` 任务清行 + 连带撤销 `user_roles` + 定向通知本人。
+  少了通知，用户只会发现"某个操作忽然 403 了"。
+
+已知限制（诚实登记）：`user_roles` 上有 `(tenant_id,user_id,role_id)` 唯一约束，
+同一人同一角色的"正式"与"临时"共用一行，回收时靠比较 `granted_at` 与授权
+`created_at` 来判断要不要连带撤销——这是间接证据。根治需要给 `user_roles`
+加 `source` 列，届时改为显式字段判断。
 
 ---
 

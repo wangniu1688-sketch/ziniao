@@ -73,7 +73,16 @@ func (s approvalSweeper) ExpireSweep(ctx context.Context, tenantID string, now t
 	return s.a.Approvals.ExpireSweep(ctx, tenantID, now)
 }
 
-// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期）。
+type grantReaper struct{ a *App }
+
+func (g grantReaper) RevokeExpired(ctx context.Context, tenantID string, now time.Time) (int, error) {
+	if g.a.Tenant == nil {
+		return 0, nil
+	}
+	return g.a.Tenant.RevokeExpiredGrants(ctx, tenantID, now)
+}
+
+// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收）。
 func (a *App) wireJobs() {
 	cfg := a.Config
 	sched := jobs.NewScheduler(tenantLister{st: a.Store}, a.Log)
@@ -82,6 +91,7 @@ func (a *App) wireJobs() {
 			cfg.Limits.DeviceExpireWarnDays, cfg.Limits.DeviceHealthMinScore),
 		jobs.NewShopPurger(trashPurger{a: a}, cfg.Limits.ShopTrashRetentionDays),
 		jobs.NewApprovalJanitor(approvalSweeper{a: a}),
+		jobs.NewTempGrantJanitor(grantReaper{a: a}),
 	)
 	a.Jobs = sched
 }

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"ziniao/approval"
@@ -77,9 +78,10 @@ func (s *Server) handleApprovalCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, apierr.Validation("请求体格式错误"))
 		return
 	}
+	detail := s.overridePurchaseDetail(r.Context(), p.TenantID, body.Type, body.Detail)
 	t, err := s.deps.Approvals.Create(r.Context(), approval.CreateInput{
 		Type: body.Type, SubjectType: body.SubjectType, SubjectID: body.SubjectID,
-		Reason: body.Reason, Detail: body.Detail,
+		Reason: body.Reason, Detail: detail,
 		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: orDefault(body.URL, "/approvals"),
 	})
 	if err != nil {
@@ -87,6 +89,53 @@ func (s *Server) handleApprovalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, t)
+}
+
+// overridePurchaseDetail 补齐只能由服务端算的字段。
+//
+// 目前只有 device.purchase 的 **金额**：审批路由规则拿单据金额决定是否要两位老板
+// 会签，而这个金额此前直接采信报文里的 detail.amount——于是"申购 100 台（几十万）
+// 把 amount 写成 100"就能走单人审批，双人复核形同虚设。
+// 与申购接口同理：金额由服务端按套餐单价重算，客户端报的一律不算数。
+func (s *Server) overridePurchaseDetail(ctx context.Context, tenantID, ticketType string, in map[string]any) map[string]any {
+	if ticketType != types.ApprovalTypeDevicePurchase {
+		return in
+	}
+	out := in
+	if out == nil {
+		out = map[string]any{}
+	}
+	months, count := numOf(out["months"]), numOf(out["count"])
+	if months <= 0 {
+		months = 1
+	}
+	if count <= 0 {
+		count = 1
+	}
+	// 与 handleDevicePurchase 共用 purchaseAmountCNY：审批定价与核销定价必须是
+	// 同一个口径，否则会出现"按 A 算法批、按 B 算法核"的分裂。
+	out["months"], out["count"] = months, count
+	out["amount"] = s.purchaseAmountCNY(ctx, tenantID, months, count)
+	return out
+}
+
+// numOf 把 JSON 数字（float64/int/字符串数字）收敛成 int。
+func numOf(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case float32:
+		return int(x)
+	case int:
+		return x
+	case int64:
+		return int(x)
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(x)); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func (s *Server) handleApprovalApprove(w http.ResponseWriter, r *http.Request) {

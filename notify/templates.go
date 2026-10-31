@@ -25,6 +25,10 @@ var templates = map[string]Template{
 	"iam.approval.rejected": {"审批结果：已驳回", "你关注的审批单已被驳回"},
 	"iam.approval.expired":  {"审批结果：已过期", "审批单超时未处理，已自动失效"},
 	"iam.approval.used":     {"高危提示：审批单已核销", "审批单已被用于高危操作"},
+
+	// 临时授权到期被回收：定向发给当事人。少了这条，用户只会发现
+	// 「某个操作忽然 403 了」，却不知道是自己的临时授权到期。
+	"iam.temp_grant.expired": {"权限到期已回收", "你的临时授权已到期并自动回收，如仍需使用请联系管理员重新授权"},
 }
 
 // TemplateOf 取模板，未命中返回通用模板。

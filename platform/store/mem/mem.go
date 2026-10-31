@@ -356,9 +356,18 @@ func (r grantRepo) Create(_ context.Context, g *types.DataGrant) error {
 	return nil
 }
 
+// ListByUser 返回该用户的全部授权记录（**含已过期的**）。
+//
+// 刻意不在仓储层吞掉过期行：这里曾经有 `expires_at < now 则跳过` 的过滤，
+// 而 identity 判定「角色是否因临时授权到期而失效」恰恰是拿这些过期记录做依据的
+// ——仓储先把它过滤掉，上层就永远看不到，结果是**临时授权到期后权限照旧**。
+// 过期与否由策略层（identity / iam）拿着 now 判定，仓储只负责把数据给全。
+//
+// 注意：这里**不能**加 s.mu.Lock()。mem 的 WithTx 已经持有同一把不可重入的锁，
+// 仓储方法再锁一次会当场自死锁（在自己的委员会帮助下重现过：测试卡 10 分钟超时）。
+// 仓储层不负责并发控制，事务边界在 WithTx。
 func (r grantRepo) ListByUser(_ context.Context, tenantID, userID, resourceType string) ([]types.DataGrant, error) {
 	out := []types.DataGrant{}
-	now := time.Now()
 	for _, g := range r.s.grants {
 		if g.TenantID != tenantID || g.UserID != userID {
 			continue
@@ -366,10 +375,26 @@ func (r grantRepo) ListByUser(_ context.Context, tenantID, userID, resourceType 
 		if resourceType != "" && g.ResourceType != resourceType {
 			continue
 		}
-		if g.ExpiresAt != nil && g.ExpiresAt.Before(now) {
-			continue // 临时授权到期自动回收
-		}
 		out = append(out, *g)
+	}
+	return out, nil
+}
+
+// DeleteExpired 删除到期行并返回副本（mem 的切片里存的是指针，直接返回 *g
+// 会把内部状态泄漏出去，调用方改一下就等于改了库）。
+// 锁的说明见 ListByUser：并发由 WithTx 负责，此处不得加锁。
+func (r grantRepo) DeleteExpired(_ context.Context, tenantID string, now time.Time) ([]types.DataGrant, error) {
+	out := []types.DataGrant{}
+	kept := make([]*types.DataGrant, 0, len(r.s.grants))
+	for _, g := range r.s.grants {
+		if g.TenantID == tenantID && g.ExpiresAt != nil && !g.ExpiresAt.After(now) {
+			out = append(out, *g)
+			continue
+		}
+		kept = append(kept, g)
+	}
+	if len(out) > 0 {
+		r.s.grants = kept
 	}
 	return out, nil
 }

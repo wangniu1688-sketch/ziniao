@@ -114,6 +114,39 @@ func TestBulkDeleteRequiresApproval(t *testing.T) {
 	}
 }
 
+// TestPurchaseTicketAmountIsServerComputed 审批单金额必须由服务端算，不能听客户端报。
+//
+// 路由规则是拿着单据金额决定要不要两位老板会签的；若采信 detail.amount，
+// "申购 198 台（5 万+）把 amount 写成 100" 就能走单人审批，双人复核形同虚设。
+func TestPurchaseTicketAmountIsServerComputed(t *testing.T) {
+	_, srv := newTestServer(t)
+	token, tenantID := registerAndLogin(t, srv.URL, "谎报团队", "buy_liar")
+
+	// 谎报金额 100 元，但真实台数/月数对应的金额远超阈值
+	st, body := do(t, "POST", srv.URL+"/api/v1/approvals", token, map[string]any{
+		"type": "device.purchase", "subject_type": "device", "reason": "旺季扩容（谎报金额）",
+		"detail": map[string]any{"amount": 100, "count": 198, "months": 4},
+		"url":    "/approvals",
+	})
+	if st != http.StatusCreated {
+		t.Fatalf("提交审批单失败: %d %v", st, body)
+	}
+	detail, _ := body["detail"].(map[string]any)
+	amount, _ := detail["amount"].(float64)
+	const want = 53856 // 198 台 × 4 月 × 68 元，按套餐单价由服务端重算
+	if amount != want {
+		t.Fatalf("单据金额应被服务端计算值覆盖，期望 %v 实际 %v（detail=%v）", want, amount, detail)
+	}
+	ticketID, _ := body["id"].(string)
+
+	// 金额修正后这条单走 owner 双人复核：运营主管不该放行
+	leadToken := inviteAndGrant(t, srv.URL, tenantID, token, "liar_lead", "ops_manager")
+	if st, _ = do(t, "POST", srv.URL+"/api/v1/approvals/"+ticketID+"/approve", leadToken,
+		map[string]any{"comment": "金额才 100 元，我批了"}); st == http.StatusOK {
+		t.Fatal("服务端算出大额后，运营主管不应放行（双人复核须 owner）")
+	}
+}
+
 // TestPurchaseQuorumRequiresTwoOwners 大额设备申购必须双人复核（会签）：
 // 阈值以下的小额申购照常放行；超过阈值则需两位 owner 分别签署。
 //
