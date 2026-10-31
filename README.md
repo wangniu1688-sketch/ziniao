@@ -301,7 +301,9 @@ id,category,actor,action,result,shop_id,ip,url,occurred_at,hash
 | 指纹注入 | 服务端下发启动单（UA/时区/Canvas/WebGL/字体/插件），窗口在**文档创建前**原样注入 |
 | 账号隔离 | 每环境独立 `profiles/<env_id>` 目录（Cookie/localStorage/IndexedDB 物理隔离） |
 | 内核一致性 | 窗口 UA 与注入画像同源，标题栏显示 内核版本/地区/代理状态 |
-| 出口代理 | 每 environment 拉起一个独立 `ziniao-proxy` 进程：HTTP CONNECT → **uTLS 重建 ClientHello**，ClientHelloID 按该环境声称的内核版本推导（JA4 实测随内核变化），窗口标题显示"代理已启用"；找不到该进程会如实显示"直连"而不伪造 TLS |
+| 出口代理 | 每 environment 拉起一个独立 `ziniao-proxy` 进程：HTTP CONNECT → **MITM**（本地 CA 动态签发目标证书）+ 对目标 **uTLS 重建 ClientHello**，窗口标题显示"代理已启用"；找不到该进程会如实显示"直连"而不伪造 TLS |
+| 版本自洽 | 环境声称的 Chrome 版本、TLS 基线、`navigator.userAgent`、**请求头 sec-ch-ua** 四者同源：uTLS 缺位的版本会把 UA 一并回落（`shop.CreateEnv`），请求头由 sidecar 在明文处改写（`network/header_rewrite.go`，身份来自 `ZINIAO_ENV_UA`） |
+| HTTP/2 | ⚠️ 现阶段**只对目标协商 HTTP/1.1**：h2 头部是 HPACK 二进制帧，无法字节改写且会导致链路不可用。留 `TLSProxyConfig.HTTP2` 开关，真正的 h2 支持需 HPACK 层改写或 fork Chromium |
 | 上网 IP | ⚠️ 本机只有一个公网出口，**多个环境共用同一 IP** ⇒ 平台仍可据此关联账号。IP 隔离必须接入住宅/ISP 代理（填 `--upstream-host/port/user/pass`，口令走环境变量 `ZINIAO_UPSTREAM_*` 而非 argv） |
 | 权限裁决 | `env:launch` 由服务端裁决（L3），启动写审计 `env.launched`（L5） |
 

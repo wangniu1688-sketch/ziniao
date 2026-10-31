@@ -31,6 +31,20 @@
   现在可以买任意 HTTP/SOCKS5 代理填 `ZINIAO_UPSTREAM_*` 立即用；
   CA 自动安装已用 `certutil -user`（用户级），其它平台 keychain/NSS TODO。
 
+## 2E. ~~UA-CH（sec-ch-ua）伪装~~ → ✅ 已补齐（`network/header_rewrite.go` + 注入脚本）
+
+- **JS 层**：注入脚本原先只在 `navigator.userAgentData` **不存在**时才伪造，而现代 Chromium
+  本来就有该值 ⇒ 保留了 WebView2 真实版本 156，与伪装 UA(120) 自相矛盾。已改为无条件覆盖，
+  并补齐 `getHighEntropyValues` / `toJSON`（brands 与 UA 同源）。
+- **网络层**：请求头里的 sec-ch-ua 是浏览器自动加的，JS 碰不到。新增 `network/header_rewrite.go`，
+  在 MITM 的明文段改写 `User-Agent` 与 sec-ch-ua 三件套（成套补齐，缺一件本身就是异常信号）。
+  身份由 `ZINIAO_ENV_UA` 注入；keep-alive 多请求、Content-Length/chunked 分帧均有测试覆盖。
+- **已知限制（写入此处的都是实测确认的）**：
+  - 只对目标协商 **HTTP/1.1**（`TLSProxyConfig.HTTP2`，默认 false）。
+    h2 的头部是 HPACK 二进制帧，无法字节改写；且在 Verified 之前先把 h2 站点打通优先。
+  - 要同时保留 HTTP/2 指纹 + 改写请求头，需做 HPACK 层解码/编码，或 fork Chromium（第 8 条）。
+- **实测**：`httpbin.org` 返回的 UA 为 `Chrome/120.0.6099.109`；本地 h2 目标站点 `code=000 → 200`。
+
 ## 2D. TLS 基线校准（部分完成，仍标 unverified）
 
 - **已做的真实校准**：本机真实 Chromium（Edge 87）对本地 raw 探针握手 vs uTLS
