@@ -98,10 +98,23 @@
 - **未做**：PDF / Excel 每页水印渲染
 - **解锁**：引入表格与 PDF 渲染库（`excelize` / `gopdf`）
 
-## 8. 未接入真实设备代理商 API
+## 8. ~~未接入真实设备代理商 API~~ → ✅ 已交付（`network/providers_http.go` + `network/allocator.go`）
 
-- **状态**：`network.Provider` 接口 + `MockProvider`
-- **解锁**：按代理商文档实现 `Acquire/Renew/Recycle`
+- **通用 REST 适配器**：厂商差异（接口路径 / 鉴权方式 / 字段名）收敛成 `VendorConfig`
+  + 宽松字段映射（host/ip/ip_address × port/http_port/socks_port…），
+  买任意一家填配置即可接入，不必为每家厂商改代码。
+- **逐环境独立出口（关键）**：此前所有环境共用客户端进程的一组 `ZINIAO_UPSTREAM_*`
+  环境变量，也就是**所有店铺同一个出口 IP**——平台据此可直接把账号串起来。
+  现由服务端资源池按环境分配、凭据随启动单下发，实测两个窗口流量零交叉
+  （出口A baidu=20/httpbin=0，出口B baidu=0/httpbin=4）。
+- **不变量**：同一出口同一时刻只绑一个环境；厂商返回重复资源会继续申请，
+  始终重复则 `ErrNoExclusiveResource`（宁可起不来也不能共 IP）；
+  同一环境重复启动返回同一出口（粘性——出口 IP 频繁跳变本身也是关联信号）。
+- **fail-closed**：分配失败直接拒绝启动，**不退回直连**（共用本机公网 IP 更糟）。
+- **代理商密钥**只经 `ZINIAO_IP_TOKEN` 环境变量注入，不进 argv（wmic 可读命令行）。
+- **仍缺**：厂商的**质量元数据**（ASN 真实类型、rDNS/TTL 一致性、黑名单历史）
+  目前按 residential 假设，纯净度打分缺真实输入；`ProxyConfig` 也未长期落库沉淀，
+  无法做「历史共用同一 ASN」的关联检测（见第 9 条）。
 
 ## 9. 其它登记项
 
