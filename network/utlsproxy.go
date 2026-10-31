@@ -70,6 +70,10 @@ type TLSProxy struct {
 	realSpec fingerprint.ClientHelloSpec
 	realErr  error
 	ca       *MITMCA
+	// rewriteCfg 请求头改写配置（UA 为空表示不改写：sidecar 未被下发该环境的 UA）
+	rewriteCfg RewriteHeaders
+	// http2 是否与目标协商 HTTP/2（见 TLSProxyConfig.HTTP2）
+	http2 bool
 }
 
 // TLSProxyConfig 前置代理配置。
@@ -80,6 +84,15 @@ type TLSProxyConfig struct {
 	Timeout  time.Duration
 	// CADir 本地 CA 目录（MITM 必需；为空则不加载 CA，CONNECT 全部失败）。
 	CADir string
+	// HTTP2 是否允许与目标协商 HTTP/2。**默认 false**：见 DialTLS 注释，
+	// 开了以后请求头无法改写且实测链路不可用，等 HPACK 层改写实现后再开。
+	HTTP2 bool
+	// UA 该环境声称的完整 User-Agent（用于改写请求头，必须与 TLS 基线同源）。
+	UA string
+	// ChromeMajor 该环境声称的 Chrome 大版本（与 UA、TLS 基线同源）。
+	ChromeMajor int
+	// Platform UA-CH 的 platform（通常是 "Windows"）。
+	Platform string
 	// Insecure 跳过证书校验。**仅本地自测对着自签探针时用**，生产必须 false
 	// （跳过校验 = 中间人可以伪造站点，与「账号安全」目标直接冲突）。
 	Insecure bool
@@ -92,12 +105,14 @@ func NewTLSProxy(cfg TLSProxyConfig) *TLSProxy {
 		to = 20 * time.Second
 	}
 	p := &TLSProxy{
-		upstream:  NewDialer(cfg.Upstream),
-		helloID:   HelloIDForName(cfg.HelloID),
-		helloName: strings.TrimSpace(cfg.HelloID),
-		baseline:  cfg.Baseline,
-		timeout:   to,
-		insecure:  cfg.Insecure,
+		upstream:   NewDialer(cfg.Upstream),
+		helloID:    HelloIDForName(cfg.HelloID),
+		helloName:  strings.TrimSpace(cfg.HelloID),
+		baseline:   cfg.Baseline,
+		timeout:    to,
+		insecure:   cfg.Insecure,
+		http2:      cfg.HTTP2,
+		rewriteCfg: RewriteHeaders{UA: cfg.UA, ChromeMajor: cfg.ChromeMajor, Platform: cfg.Platform},
 	}
 	if cfg.CADir != "" {
 		if ca, err := LoadOrCreateCA(cfg.CADir); err == nil {
@@ -173,6 +188,38 @@ func (p *TLSProxy) MatchesBaseline() (bool, string) {
 	return p.baseline.JA3Hash == hash, p.baseline.JA3Hash + " vs " + hash
 }
 
+// uClient 构造 uTLS 客户端连接。
+//
+// 默认（HTTP2=false）会把 ClientHello 里的 ALPN 限制为 http/1.1：
+// 代理一旦与目标协商 h2，头部就变成 HPACK 编码的二进制帧——既无法改写身份头
+// （sec-ch-ua 会暴露真实内核版本），实测连透传都会失败（浏览器侧是 h1 字节，
+// 不能被塞进 h2 连接）。与其做一个对多数站点不可用的代理，不如先用 h1 保证
+// 可用性与请求头一致性；真正的 h2 支持需要 HPACK 层改写或 fork Chromium。
+//
+// 注意：必须改 spec 里的 ALPNExtension——uTLS 用 HelloID 对应的完整 spec 装箱，
+// 光设置 cfg.NextProtos 是无效的（实测仍协商出 h2）。
+func (p *TLSProxy) uClient(conn net.Conn, cfg *utls.Config) (*utls.UConn, error) {
+	if p.http2 {
+		return utls.UClient(conn, cfg, p.helloID), nil
+	}
+	spec, err := utls.UTLSIdToSpec(p.helloID)
+	if err != nil {
+		return utls.UClient(conn, cfg, p.helloID), nil
+	}
+	for i, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			clone := *alpn
+			clone.AlpnProtocols = []string{"http/1.1"}
+			spec.Extensions[i] = &clone
+		}
+	}
+	uconn := utls.UClient(conn, cfg, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return uconn, nil
+}
+
 // DialTLS 经上游代理拨号并用 uTLS 完成 TLS 握手。
 func (p *TLSProxy) DialTLS(ctx context.Context, addr string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
@@ -185,7 +232,11 @@ func (p *TLSProxy) DialTLS(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	cfg := &utls.Config{ServerName: host, MinVersion: tls.VersionTLS12, InsecureSkipVerify: p.insecure}
-	uconn := utls.UClient(conn, cfg, p.helloID)
+	uconn, err := p.uClient(conn, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	uconn.SetSNI(host)
 	if dl, ok := ctx.Deadline(); ok {
 		_ = uconn.SetDeadline(dl)
@@ -314,17 +365,11 @@ func (p *TLSProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err == nil {
 		_ = buf.Flush()
 	}
-	// 2) 对客户端伪装成目标站点：用本地 CA 动态签发目标证书完成 TLS 握手
+	// 2) 先与目标握手：必须知道目标协商出的 ALPN，才能在下一步给客户端同样的选择。
+	// 顺序不能反——两侧 ALPN 不一致时，h1 的请求字节会被送进 h2 连接（或反之），
+	// 而字节搬运无法跨协议，页面必然打不开（实测 code=000）。
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
-	tlsConn := tls.Server(client, p.ca.ServerTLSConfigFor(r.URL.Host))
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "mitm: 与客户端握手失败 target=%s err=%v\n", target, err)
-		_ = client.Close()
-		return
-	}
-	defer func() { _ = tlsConn.Close() }()
-	// 3) 对目标做 uTLS 握手（这一端发出的 ClientHello = 内核基线指纹）
 	upstream, err := p.DialTLS(ctx, target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mitm: 与目标握手失败 target=%s err=%v\n", target, err)
@@ -332,9 +377,35 @@ func (p *TLSProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = upstream.Close() }()
+	alpn := ""
+	if uc, ok := upstream.(*utls.UConn); ok {
+		alpn = uc.ConnectionState().NegotiatedProtocol
+	}
+	// 3) 对客户端伪装成目标站点：本地 CA 动态签发目标证书；
+	// ALPN 必须与目标协商结果一致（目标支持 h2 就给 h2，否则给 h1）。
+	srvTLS := p.ca.ServerTLSConfigFor(r.URL.Host)
+	if alpn != "" {
+		srvTLS.NextProtos = []string{alpn}
+	}
+	tlsConn := tls.Server(client, srvTLS)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "mitm: 与客户端握手失败 target=%s err=%v\n", target, err)
+		_ = client.Close()
+		return
+	}
+	defer func() { _ = tlsConn.Close() }()
 	// 4) 明文桥接（两侧各自 TLS）
+	// 客户端→目标这段是明文 HTTP：在这里改写身份头（sec-ch-ua 是浏览器自动加的，
+	// JS 改不掉，不改写就会出现「UA 说 120、请求头说 156」的自相矛盾）
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, tlsConn); done <- struct{}{} }()
+	go func() {
+		if cfg := p.rewriteCfg; cfg.UA != "" {
+			_ = copyRewritingRequests(upstream, tlsConn, cfg)
+		} else {
+			_, _ = io.Copy(upstream, tlsConn)
+		}
+		done <- struct{}{}
+	}()
 	go func() { _, _ = io.Copy(tlsConn, upstream); done <- struct{}{} }()
 	<-done
 	_ = client.Close()

@@ -185,6 +185,10 @@ async fn ensure_proxy(app: &tauri::AppHandle, spec: &LaunchSpec) -> bool {
             spec.kernel_major.to_string(),
         ])
         .envs(upstream_envs)
+        // 该环境声称的 UA：sidecar 用它改写请求头里的 sec-ch-ua。
+        // 浏览器在发出请求时会自动带上真实内核版本的 UA-CH（本机 WebView2 是 156），
+        // JS 改不了这一层，只能由代理在明文处对齐，否则 UA 与请求头自相矛盾。
+        .env("ZINIAO_ENV_UA", &spec.user_agent)
         .spawn();
     // 等待代理起来（uTLS 握手参数由 Go 侧按内核基线构造）
     for _ in 0..20 {

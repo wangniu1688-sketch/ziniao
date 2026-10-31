@@ -170,6 +170,11 @@ func (l *BaselineLibrary) For(major int) (*TLSBaseline, bool) {
 	return &bl, true
 }
 
+// ChromeMajorFromUA 从任意 UA 串解析 Chrome 大版本（导出版，供其它包对齐身份用）。
+func ChromeMajorFromUA(ua string) (int, error) {
+	return chromeMajorFromUA(ua)
+}
+
 // ParseChromeMajorFromHelloID 从 uTLS 的 HelloID 名里解析它**实际代表**的 Chrome 大版本
 // （HelloChrome_120_PQ → 120；HelloChrome_Auto → 0，表示不绑定版本）。
 //

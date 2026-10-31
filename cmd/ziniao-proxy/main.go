@@ -34,6 +34,22 @@ import (
 	"ziniao/network"
 )
 
+// platformOfUA 从 UA 推断 UA-CH 的 platform 字段（Chrome 只发这几个取值）。
+func platformOfUA(ua string) string {
+	switch {
+	case strings.Contains(ua, "Android"):
+		return "Android"
+	case strings.Contains(ua, "iPhone"), strings.Contains(ua, "iPad"), strings.Contains(ua, "Macintosh"):
+		return "macOS"
+	case strings.Contains(ua, "Windows"):
+		return "Windows"
+	case strings.Contains(ua, "Linux"):
+		return "Linux"
+	default:
+		return "Windows"
+	}
+}
+
 // applyEnvFallbacks 命令行未显式给出时，从环境变量补齐（凭证不要走 argv）。
 func applyEnvFallbacks(m map[string]*string) {
 	for k, dst := range m {
@@ -45,20 +61,21 @@ func applyEnvFallbacks(m map[string]*string) {
 
 func main() {
 	var (
-		listen   = flag.String("listen", "127.0.0.1:20000", "本地监听地址")
-		kernel   = flag.Int("kernel", 0, "Chromium 内核大版本（按基线库推导 ClientHello）")
-		helloID  = flag.String("hello-id", "", "直接指定 uTLS ClientHelloID（优先于 --kernel）")
-		upHost   = flag.String("upstream-host", "", "上游代理主机（留空=本机直连）")
-		upPort   = flag.Int("upstream-port", 0, "上游代理端口")
-		upProto  = flag.String("upstream-proto", "http", "上游代理协议：http|https|socks5|direct")
-		upUser   = flag.String("upstream-user", "", "上游代理用户名（L4：不入日志）")
-		upPass   = flag.String("upstream-pass", "", "上游代理口令（L4：不入日志）")
-		caDir    = flag.String("ca-dir", "", "本地 CA 目录（默认 %APPDATA%\\ziniao\\ca）")
-		installC = flag.Bool("install-ca", true, "首次运行时把本地 CA 装入当前用户信任库（certutil -user）")
-		exportCA = flag.String("export-ca", "", "把本地根证书导出到指定路径后退出（给用户手动信任/排障用）")
-		uninstCA = flag.Bool("uninstall-ca", false, "从当前用户信任库移除本地根证书（卸载/合规要求）")
-		insecure = flag.Bool("insecure", false, "跳过证书校验（仅本地自签探针自测用）")
-		timeout  = flag.Duration("timeout", 20*time.Second, "单次连接超时")
+		listen    = flag.String("listen", "127.0.0.1:20000", "本地监听地址")
+		kernel    = flag.Int("kernel", 0, "Chromium 内核大版本（按基线库推导 ClientHello）")
+		helloID   = flag.String("hello-id", "", "直接指定 uTLS ClientHelloID（优先于 --kernel）")
+		upHost    = flag.String("upstream-host", "", "上游代理主机（留空=本机直连）")
+		upPort    = flag.Int("upstream-port", 0, "上游代理端口")
+		upProto   = flag.String("upstream-proto", "http", "上游代理协议：http|https|socks5|direct")
+		upUser    = flag.String("upstream-user", "", "上游代理用户名（L4：不入日志）")
+		upPass    = flag.String("upstream-pass", "", "上游代理口令（L4：不入日志）")
+		caDir     = flag.String("ca-dir", "", "本地 CA 目录（默认 %APPDATA%\\ziniao\\ca）")
+		installC  = flag.Bool("install-ca", true, "首次运行时把本地 CA 装入当前用户信任库（certutil -user）")
+		exportCA  = flag.String("export-ca", "", "把本地根证书导出到指定路径后退出（给用户手动信任/排障用）")
+		uninstCA  = flag.Bool("uninstall-ca", false, "从当前用户信任库移除本地根证书（卸载/合规要求）")
+		insecure  = flag.Bool("insecure", false, "跳过证书校验（仅本地自签探针自测用）")
+		timeout   = flag.Duration("timeout", 20*time.Second, "单次连接超时")
+		rewriteUA = flag.String("rewrite-ua", "", "该环境声称的 User-Agent（用于改写请求头 UA/sec-ch-ua；默认值取环境变量 ZINIAO_ENV_UA）")
 	)
 	flag.Parse()
 
@@ -125,14 +142,32 @@ func main() {
 		}
 		*caDir = filepath.Join(appdata, "ziniao", "ca")
 	}
+	// 该环境声称的 UA：命令行 --rewrite-ua（UA 不是机密，必然在线路上出现）或
+	// 环境变量 ZINIAO_ENV_UA（客户端拉起本进程时注入）。
+	// 用途：改写浏览器自动加的 sec-ch-ua 请求头——那东西 JS 改不了，
+	// 不改写就会出现「UA 说 120、请求头说 156」的自相矛盾。
+	envUA := strings.TrimSpace(*rewriteUA)
+	if envUA == "" {
+		envUA = strings.TrimSpace(os.Getenv("ZINIAO_ENV_UA"))
+	}
+	majorFromUA, platformFromUA := 0, ""
+	if envUA != "" {
+		if major, err := fingerprint.ChromeMajorFromUA(envUA); err == nil {
+			majorFromUA = major
+		}
+		platformFromUA = platformOfUA(envUA)
+	}
 	proxy := network.NewTLSProxy(network.TLSProxyConfig{
 		Upstream: up,
 		HelloID:  name,
 		Timeout:  *timeout,
 		CADir:    *caDir,
 		Insecure: *insecure,
+		// 请求头改写：把浏览器自动加的 sec-ch-ua / User-Agent 对齐到本环境声称的版本
+		UA:          envUA,
+		ChromeMajor: majorFromUA,
+		Platform:    platformFromUA,
 	})
-	// CA 维护类命令：导出 / 卸载（都只动当前用户信任库，不碰机器级）
 	if *exportCA != "" {
 		data, err := os.ReadFile(proxy.CA().CertPath())
 		if err != nil {

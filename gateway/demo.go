@@ -27,8 +27,13 @@ type DemoReport struct {
 	CookieUser string `json:"cookie_user"` // 服务端读到的 Cookie（HttpOnly，页面 JS 取不到）
 	LSUser     string `json:"ls_user"`     // 页面 JS 从 localStorage 读到的账号
 	UA         string `json:"ua"`
-	Baseline   string `json:"baseline"`
-	At         string `json:"at"`
+	// UACH 浏览器侧 UA-CH（navigator.userAgentData）——必须与 UA 的 Chrome 版本同源，
+	// 若这里仍是 WebView2 真实内核版本则暴露「UA 被改过」
+	UACH string `json:"uach"`
+	// SecCHUA 服务端收到的 sec-ch-ua 请求头（HTTP 层，JS 改不了，只能靠代理层改写）
+	SecCHUA  string `json:"sec_ch_ua"`
+	Baseline string `json:"baseline"`
+	At       string `json:"at"`
 }
 
 // DemoStore 报告暂存（进程内存，demo 专用）。
@@ -87,6 +92,7 @@ func demoRoutes(m *http.ServeMux, store *DemoStore) {
 			ReportID string `json:"report_id"`
 			LSUser   string `json:"ls_user"`
 			Baseline string `json:"baseline"`
+			UACH     string `json:"uach"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		var cookieUser string
@@ -95,8 +101,9 @@ func demoRoutes(m *http.ServeMux, store *DemoStore) {
 		}
 		store.put(DemoReport{
 			ReportID: body.ReportID, CookieUser: cookieUser, LSUser: body.LSUser,
-			UA: r.UserAgent(), Baseline: body.Baseline,
-			At: time.Now().UTC().Format(time.RFC3339),
+			UA: r.UserAgent(), UACH: body.UACH, SecCHUA: r.Header.Get("sec-ch-ua"),
+			Baseline: body.Baseline,
+			At:       time.Now().UTC().Format(time.RFC3339),
 		})
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -159,7 +166,8 @@ if(q.get('logout')!=='1'){
     '<a class="btn" href="/demo/clear?report='+encodeURIComponent(rid)+'">退出</a>';
 }
 fetch('/demo/report',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({report_id:rid,ls_user:lsUser,baseline:window.__ZINIAO_BASELINE__||''})});
+  body:JSON.stringify({report_id:rid,ls_user:lsUser,baseline:window.__ZINIAO_BASELINE__||'',
+    uach:(navigator.userAgentData&&navigator.userAgentData.toJSON)?JSON.stringify(navigator.userAgentData.toJSON()):'(none)'})});
 </script></div></body></html>`
 	// 服务端把 HttpOnly Cookie 里的账号注入页面（页面 JS 取不到 HttpOnly cookie，
 	// 这正是要验证的东西：每个环境是否随身带着只属于自己的登录态）

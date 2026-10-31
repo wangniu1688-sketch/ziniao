@@ -115,7 +115,18 @@ def(N,'hardwareConcurrency',C.hardwareConcurrency);def(N,'deviceMemory',C.device
 def(N,'language',C.language);def(N,'languages',C.languages);
 def(N,'maxTouchPoints',C.maxTouchPoints);
 try{Object.defineProperty(N,'userAgent',{get:function(){return C.ua;},configurable:true});}catch(e){}
-if(!N.userAgentData){def(N,'userAgentData',{brands:[{brand:'Chromium',version:C.ua.match(/Chrome\/(\d+)/)?RegExp.$1:'131'}],mobile:false,platform:C.platform});}
+// UA-CH(userAgentData)：必须与 UA 里的 Chrome 版本同源。
+// 原写法只在 navigator.userAgentData 不存在时才伪造，可现代 Chromium 本来就有这个值，
+// 于是直接保留内核真实版本（本机 WebView2 是 156），与伪装的 UA(120) 自相矛盾——
+// 这等于主动告诉检测站「UA 被改过」。必须无条件覆盖，并补齐 getHighEntropyValues。
+// 注意：整段脚本是 Go 的 raw string，里面任何位置都不能出现反引号。
+var _m=C.ua.match(/Chrome\/([\d.]+)/);var _mj=_m?_m[1].split('.')[0]:'120';var _fv=_m?_m[1]:'120.0.0.0';
+var _pv=/Windows NT 10\.0/.test(C.ua)?'10.0.0':(/Windows NT 6\.1/.test(C.ua)?'6.1.0':'10.0.0');
+var _uad={brands:[{brand:'Not_A Brand',version:'8'},{brand:'Chromium',version:_mj},{brand:'Google Chrome',version:_mj}],mobile:false,platform:'Windows',
+getHighEntropyValues:function(h){return Promise.resolve({architecture:'x86',bitness:'64',model:'',platformVersion:_pv,uaFullVersion:_fv,fullVersionList:[{brand:'Not_A Brand',version:'8.0.0.0'},{brand:'Chromium',version:_fv},{brand:'Google Chrome',version:_fv}]});},
+toJSON:function(){return {brands:this.brands,mobile:this.mobile,platform:this.platform};}};
+try{Object.defineProperty(Navigator.prototype,'userAgentData',{get:function(){return _uad;},configurable:true});}catch(e){}
+def(N,'userAgentData',_uad);
 // ---- plugins / mimeTypes（必须与画像整体一致，见反例 5）----
 function MT(name,type,desc,suffix){this.name=name;this.type=type;this.description=desc;this.suffixes=suffix||'';}
 var pl=C.plugins.map(function(x){var o=new MT(x.name,'application/pdf',x.description,'pdf');o.filename=x.filename;o.length=1;return o;});
