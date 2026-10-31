@@ -343,9 +343,66 @@ func (s *Service) Consume(ctx context.Context, tenantID, ticketID string, actor 
 	})
 }
 
-// ExpireSweep 把超时未决的审批单置为过期（定时任务调用）。
+// ExpireSweep 把超时未决的审批单置为过期并对每张单投递 iam.approval.expired。
+//
+// 修正（清点发现）：原实现只把状态改成 expired、什么都不发，而 notify 的过期
+// 模板早已写好、却在等一个永远不会来的事件。结果是「申请单悄悄失效了，申请人
+// 毫不知情」——审批流程里最忌讳的静默失败。现在申请人会收到一条过期通知，
+// 不必一直守着页面。
 func (s *Service) ExpireSweep(ctx context.Context, tenantID string, now time.Time) (int, error) {
-	return s.st.Approvals().ExpireBefore(store.WithTenant(ctx, tenantID), now)
+	tctx := store.WithTenant(ctx, tenantID)
+	n := 0
+	err := s.st.WithTx(tctx, func(tx store.Tx) error {
+		// ExpireBefore 只给受影响行数，而通知需要单号与申请人，故先捞出待过期清单。
+		pending, _, err := tx.Approvals().List(tctx, store.ApprovalFilter{
+			Status: types.ApprovalPending, Limit: 500,
+		})
+		if err != nil {
+			return err
+		}
+		doomed := make([]types.ApprovalTicket, 0, len(pending))
+		for _, t := range pending {
+			if !t.ExpiresAt.After(now) {
+				doomed = append(doomed, t)
+			}
+		}
+		if len(doomed) == 0 {
+			return nil
+		}
+		affected, err := tx.Approvals().ExpireBefore(tctx, now)
+		if err != nil {
+			return err
+		}
+		n = affected
+		// 系统而非个人发起的动作：Actor 留空，Terminal 标注来源为定时任务，
+		// 保证事后追溯时看得出这不是某个人点的。
+		term := eventbus.Terminal{Mode: "job", ClientVer: "jobs/1"}
+		for _, t := range doomed {
+			if err := s.bus.Emit(tctx, tx, eventbus.Event{
+				TenantID:   tenantID,
+				Type:       TypeExpired,
+				OccurredAt: now,
+				// 必须是 medium 以上：notify.Sink 对 low 风险事件直接 return nil，
+				// 用 low 的话事件照样发出去、照样进审计，但谁也收不到通知。
+				Risk:     eventbus.RiskMedium,
+				Terminal: term,
+				Context:  eventbus.ContextInfo{Action: "approval.expire", Result: "blocked"},
+				Data: map[string]any{
+					"ticket_id": t.ID, "type": t.Type, "status": string(types.ApprovalExpired),
+					// 定向通知：逾期通知只对申请人有意义，不该打扰审批人。
+					"approver_ids": []string{t.RequesterID},
+					"requester_id": t.RequesterID,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // Required 判断某个动作是否需要二次审批（配置中心驱动，不硬编码）。

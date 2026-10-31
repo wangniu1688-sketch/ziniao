@@ -40,7 +40,7 @@ func (s *Server) docs() {
 
 		// Phase 1
 		{Method: "GET", Path: "/api/v1/devices", Tag: "设备", Summary: "设备列表", Permission: "device:read"},
-		{Method: "POST", Path: "/api/v1/devices/purchase", Tag: "设备", Summary: "购买云网络设备", Permission: "device:purchase"},
+		{Method: "POST", Path: "/api/v1/devices/purchase", Tag: "设备", Summary: "购买云网络设备（金额超阈值须 device.purchase 审批单，大额双人复核）", Permission: "device:purchase"},
 		{Method: "POST", Path: "/api/v1/devices/import", Tag: "设备", Summary: "导入自有设备/紫鸟盒子", Permission: "device:import"},
 		{Method: "POST", Path: "/api/v1/devices/{id}/bind", Tag: "设备", Summary: "绑定店铺到设备（配额模型，非互斥锁）", Permission: "device:bind"},
 		{Method: "POST", Path: "/api/v1/devices/{id}/acquire", Tag: "设备", Summary: "占用设备（并发人数按人去重）", Permission: "device:read"},
@@ -80,6 +80,7 @@ func (s *Server) docs() {
 		{Method: "GET", Path: "/api/v1/jobs", Tag: "系统", Summary: "定时任务列表", Permission: "job:read"},
 		{Method: "POST", Path: "/api/v1/jobs/run", Tag: "系统", Summary: "手动触发定时任务", Permission: "job:run"},
 		{Method: "POST", Path: "/api/v1/shops/batch/import", Tag: "店铺", Summary: "批量导入（逐行配额校验，部分成功返回 207）", Permission: "shop:create"},
+		{Method: "POST", Path: "/api/v1/shops/batch/delete", Tag: "店铺", Summary: "批量删除（须持 shop.bulk_delete 审批单，单次核销）", Permission: "shop:delete"},
 	}
 	for _, op := range ops {
 		openapi.Register(op)

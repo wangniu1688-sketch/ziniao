@@ -9,6 +9,7 @@ import (
 	"ziniao/approval"
 	"ziniao/eventbus"
 	"ziniao/iam"
+	"ziniao/notify"
 	"ziniao/platform/apierr"
 	"ziniao/platform/config"
 	"ziniao/platform/store"
@@ -170,6 +171,67 @@ func TestExpiry(t *testing.T) {
 	got, _, err := e.svc.List(ctx, e.owner, store.ApprovalFilter{Limit: 10}, "/shops")
 	if err != nil || len(got) != 1 || got[0].Status != types.ApprovalExpired {
 		t.Fatalf("状态应为 expired: %+v err=%v", got, err)
+	}
+}
+
+// TestExpiryNotifiesRequester 过期必须「被看见」：投递 iam.approval.expired 并定向通知申请人。
+//
+// 这条断言防的是一类很难靠肉眼发现的回归——以前 ExpireSweep 只改状态不发事件，
+// 而通知模板早已写好，结果申请人永远不知道自己的单据悄悄失效了。
+// 同时验证风险等级不能用 low：notify.Sink 会直接丢弃 low 风险事件。
+func TestExpiryNotifiesRequester(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	bus := eventbus.New(e.st, config.Default(), slog.Default())
+	bus.Register(notify.NewSink(e.st, slog.Default()))
+	cfg := config.Default()
+	cfg.Limits.ApprovalTTLSeconds = 1
+	svc := approval.NewService(e.st, bus, cfg, iam.NewEngine(config.Default()))
+
+	if _, err := svc.Create(ctx, approval.CreateInput{
+		Type: types.ApprovalTypeCredReveal, SubjectType: "shop", SubjectID: "shop-1",
+		Reason: "排查登录异常", Actor: e.owner, URL: "/shops",
+	}); err != nil {
+		t.Fatalf("提交审批单失败: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if n, err := svc.ExpireSweep(ctx, "t1", time.Now().UTC()); err != nil || n != 1 {
+		t.Fatalf("过期扫描应命中 1 条，实际 %d err=%v", n, err)
+	}
+
+	// 派发：注意 mem 的 Claim 会把事件置为 claimed，故这里直接派发、不预先查发件箱，
+	// 用「通知最终落在谁头上」来反证事件确实投递了。
+	if _, err := bus.DispatchOnce(ctx); err != nil {
+		t.Fatalf("事件派发失败: %v", err)
+	}
+
+	// 申请人必须收到过期通知——这条同时证明：
+	//  1. 事件真的发出去了（不再是只改状态）；
+	//  2. 风险等级没设置在 low（notify.Sink 会丢弃 low）；
+	//  3. 通知定向到申请人本人。
+	list, err := e.st.Notifications().List(ctx, "t1", e.owner.UserID, 20)
+	if err != nil {
+		t.Fatalf("读取通知失败: %v", err)
+	}
+	hit := false
+	for _, n := range list {
+		if n.EventType == approval.TypeExpired {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("申请人应收到过期通知，实际收到 %d 条：%+v", len(list), list)
+	}
+
+	// 定向而非广播：审批人（运营主管）不该被这条过期通知打扰。
+	lead, err := e.st.Notifications().List(ctx, "t1", e.leader.UserID, 20)
+	if err != nil {
+		t.Fatalf("读取审批人通知失败: %v", err)
+	}
+	for _, n := range lead {
+		if n.EventType == approval.TypeExpired {
+			t.Fatal("过期通知应只给申请人，审批人不应收到")
+		}
 	}
 }
 

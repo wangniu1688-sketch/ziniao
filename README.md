@@ -106,7 +106,7 @@ notify/            通知中心（站内 + 通道驱动）
 shop/              店铺实体 + 生命周期状态机 + 浏览器环境 + 账密托管（信封加密）
 platform/          共享内核：config / apierr / crypto(信封加密) / ids / store / openapi / migrate
 app/               组合根：装配全部模块（服务端与测试共用）
-migrations/        SQL 迁移（0001 核心 / 0002 设备与环境，均可回滚）
+migrations/        SQL 迁移（0001 核心 / 0002 设备与环境 / 0003 审批工单 / 0004 环境启动，均可回滚）
 docs/              ADR、权限矩阵、计费规则、未实现项清单
 ```
 
@@ -281,10 +281,28 @@ id,category,actor,action,result,shop_id,ip,url,occurred_at,hash
 任务以 `system` 身份写审计，`Terminal.Mode=job` 标记来源；`POST /api/v1/jobs/run`
 可手动触发（不必等定时），`Jobs` 按 `Interval` 节流避免重复告警。
 
-### 9.4 批量导入
+### 9.4 批量导入 / 批量删除
 
-`POST /api/v1/shops/batch/import`：逐行走权限 + 配额 + 审计，失败行不影响其它行；
-**部分成功返回 207**，失败原因可读（如"店铺名长度需在 1-60 之间""配额超限"）。
+**导入**（`POST /api/v1/shops/batch/import`）支持两种提交方式：
+
+| 方式 | 用法 |
+|---|---|
+| 上传 CSV | `multipart/form-data`，字段名 `file`（表头 `name,platform,site,group`，顺序任意；支持无表头文件；兼容 Excel 导出的 BOM） |
+| JSON | `{"rows":[{...}]}`（脚本调用用这个） |
+
+```http
+GET  /api/v1/shops/batch/template            → CSV 模板（带 BOM，Excel 打开不乱码）
+POST /api/v1/shops/batch/import?dry_run=1    → 只体检：报出脏行，不写任何数据
+POST /api/v1/shops/batch/import              → 逐行走权限 + 配额 + 审计；部分成功返回 **207**
+```
+
+行级失败不牵连整批——客户给的表从来就不干净（空行、缺名称、文件内重名），
+"有一行脏数据就让整份文件作废"是最容易被运营骂的实现。失败行计入 `total`，
+不会让人以为那些行被静默丢掉了。单次上限 1000 行，超了整份拒绝。
+
+**删除**（`POST /api/v1/shops/batch/delete`）：一次勾删几十家时人工逐个确认已失去意义，
+能真正拦住误操作的是**事前那张审批单**——须持已通过的 `shop.bulk_delete` 单据，
+执行后单据即核销，一张单不能清两次库。
 
 ---
 

@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"ziniao/device"
 	"ziniao/fingerprint"
@@ -88,6 +90,46 @@ func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": list, "total": total})
 }
 
+// purchaseAmountCNY 本次申购金额（元）＝套餐单价 × 月数 × 台数。
+// 由服务端计算，避免客户端谎报金额绕过阈值。取不到套餐时返回 0（不卡申购）。
+func (s *Server) purchaseAmountCNY(ctx context.Context, tenantID string, months, count int) float64 {
+	if s.deps.Entitlement == nil {
+		return 0
+	}
+	return device.PurchaseAmountCNY(ctx, s.deps.Entitlement, tenantID, months, count)
+}
+
+// purchaseNeedsApproval 本次申购是否需要持证：金额达到审批阈值即需要。
+//
+// 这里刻意区分金额：小额零星申购不该走审批，否则日常操作被流程拖垮，
+// 最后的结果一定是大家想方设法绕过流程。阈值本身是可配置项。
+func (s *Server) purchaseNeedsApproval(ctx context.Context, tenantID string, months, count int) bool {
+	threshold := 0.0
+	if s.deps.Config != nil {
+		threshold = s.deps.Config.Limits.WithdrawApprovalThresholdCNY
+	}
+	if threshold <= 0 {
+		threshold = 50000
+	}
+	return s.purchaseAmountCNY(ctx, tenantID, months, count) >= threshold
+}
+
+// ticketAmountOf 取审批单上的金额（JSON 数字经反序列化为 float64）。
+func ticketAmountOf(t *types.ApprovalTicket) float64 {
+	if t == nil || t.Detail == nil {
+		return 0
+	}
+	switch v := t.Detail["amount"].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	}
+	return 0
+}
+
 func (s *Server) handleDevicePurchase(w http.ResponseWriter, r *http.Request) {
 	p, subj, _, err := s.authorize(r, "device:purchase", "/devices")
 	if err != nil {
@@ -105,20 +147,57 @@ func (s *Server) handleDevicePurchase(w http.ResponseWriter, r *http.Request) {
 		Region  string `json:"region"`
 		City    string `json:"city"`
 		Months  int    `json:"months"`
+		Count   int    `json:"count"`
 		URL     string `json:"url"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, apierr.Validation("请求体格式错误"))
 		return
 	}
+	if body.Count < 0 {
+		writeErr(w, apierr.Validation("申购台数不能为负"))
+		return
+	}
+	if body.Count == 0 {
+		body.Count = 1
+	}
+	months := body.Months
+	if months <= 0 {
+		months = 1
+	}
+	// 大额申购闸门：金额由服务端按套餐单价重算，达到阈值就必须持有一张已经双人
+	// 签署过的 device.purchase 审批单。这是会签引擎唯一现实的入口——之前路由规则
+	// 写好了却没有任何地方 Verify 它，等于没接电。
+	ticketID := r.URL.Query().Get("ticket")
+	// 两条都必须走校验：金额达阈值必须持证；此外只要客户端**带了**单据，
+	// 这张单就必须是有效可用的——否则拿着一张已核销/已拒绝的单据也能混过去，
+	// 让审计里留下一个根本没生效的「审批依据」。
+	needsTicket := s.purchaseNeedsApproval(r.Context(), p.TenantID, months, body.Count)
+	if s.deps.Approvals != nil && (needsTicket || ticketID != "") {
+		ticket, err := s.deps.Approvals.Verify(r.Context(), p.TenantID, ticketID,
+			types.ApprovalTypeDevicePurchase, subj.UserID)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		// 防「拿小额单据买大额」：单据金额必须覆盖本次申购，否则重新开单。
+		if needsTicket && ticketAmountOf(ticket) < s.purchaseAmountCNY(r.Context(), p.TenantID, months, body.Count) {
+			writeErr(w, apierr.Approval("审批单金额不足以覆盖本次申购额度，请按实际金额重新提交审批单"))
+			return
+		}
+		ticketID = ticket.ID
+	}
 	d, err := s.deps.Device.Purchase(r.Context(), device.PurchaseInput{
 		Name: body.Name, Type: types.DeviceType(body.Type), Country: body.Country,
-		Region: body.Region, City: body.City, PeriodMonths: body.Months,
+		Region: body.Region, City: body.City, PeriodMonths: months, Count: body.Count,
 		Actor: p2subject(p, subj), Terminal: terminalFrom(r), URL: body.URL,
 	})
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if s.deps.Approvals != nil && ticketID != "" {
+		_ = s.deps.Approvals.Consume(r.Context(), p.TenantID, ticketID, p2subject(p, subj), terminalFrom(r))
 	}
 	writeJSON(w, http.StatusCreated, d)
 }
@@ -731,6 +810,15 @@ func (s *Server) handleFingerprintLayers(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": fingerprint.LayerTable()})
+}
+
+// queryBool 解析布尔查询参数：?dry_run=1 / true / yes 均为真。
+func queryBool(r *http.Request, key string) bool {
+	switch strings.ToLower(r.URL.Query().Get(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func queryInt(r *http.Request, key string, def int) int {

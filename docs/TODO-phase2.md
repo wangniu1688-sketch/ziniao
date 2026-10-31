@@ -73,12 +73,26 @@
 - **暴露方式**：自检报告 `consistency.unverified: ["ja3-match"]`、基线 `source=unverified`
 - **解锁**：采集真实 Chrome 115/120/131 覆盖 `fingerprint/data/tls_baseline.json`
 
-## 4. PostgreSQL 未实跑（含新增的 0003 迁移）
+## 4. ~~PostgreSQL 未实跑（含新增的 0003 迁移）~~ → ✅ 已实跑（PostgreSQL 16.15）
 
-- **状态**：0001/0002/0003 迁移与 pg 驱动均为编译期验证；`tenantRepo.List` 依赖
-  `admin_list` 策略（`current_tenant() IS NULL`）放行定时任务与运营后台
-- **原因**：本机无 Docker / PostgreSQL
-- **解锁**：`docker compose up postgres` → `go run ./cmd/server -store postgres -migrate`
+- **实跑方式**：本机安装 PostgreSQL **16.15**（与 `docker-compose.yml` 的 `postgres:16-alpine`
+  对齐，方便以后换成容器不用改 expectations）→
+  `go run ./cmd/server -store postgres -migrate -seed`
+- **已验证**：迁移 0001/0002/**0003/0004** 全部执行成功；种子数据写入；登录后
+  建单/审批/核销/批量删除/审计导出（含水印）/通知/定时任务手动触发全链路跑通；
+  `tenantRepo.List` 依赖的 `admin_list` 策略正常放行定时任务。
+- **本次因此修掉的 4 个 pg 路径缺陷**（mem 实现全部测不出来）。区分「怎么发现的」，
+  是因为前两个是实跑撞出来的、后两个是接上库之前的代码审查先排掉的，不该混为一谈：
+
+  | 缺陷 | 怎么发现的 | 现象 / 根因 |
+  |---|---|---|
+  | 内置角色写不进去 | **实跑撞出** | `not-null violation: roles.mask_fields`。Go 的 nil 切片被编成 SQL NULL，而列的 `DEFAULT '{}'` 只在**省略该列**时生效；除 finance 外所有内置角色的 MaskFields 都是 nil |
+  | **任何授权都失败** | **实跑撞出** | seed 报「角色不存在: finance」。pg 的 `roles.GetByCode` 用租户完全相等匹配，取不到系统级角色，而 mem 允许回退 ⇒ 单测全绿、生产完全不可用 |
+  | 审批列表分页错误 | **接库前审查发现，随即实跑验证** | 分页误用了占位符计数器 `n`，无筛选条件时会拼出 `LIMIT 2 OFFSET 3` 且多出两个无占位符的参数 |
+  | 其它 `text[] NOT NULL` 列 | **防御性归一** | `shops.tags` / `notifications.channels` 同属「nil 切片变 NULL」，与第一条同源，一并加 `strArr` 归一化 |
+
+- **结论**：`mem` 与 `pg` 的语义差异是本类缺陷的温床。凡是「租户级 + 系统级」混合的数据
+  （角色、策略模板），两边的取值口径必须逐条对齐。
 
 ## 5. ~~审批工单的「审批人路由规则」~~ → ✅ 已实现（`approval/router.go`）
 
@@ -98,6 +112,12 @@
 - **为什么不把「揭示口令」收成 owner-only**：老板自己申请时若只允许老板批，团队里没人能批，
   流程直接死锁。故保留 ops_manager，把最高级别留给影响全团队的审计导出。
 - **实测**：普通运营（有 approval:approve 权限）尝试批准揭示口令 → 403；运营主管 → 通过。
+- **补齐生产入口（本轮）**：以上规则此前只是「写好但没人调用」——没有任何接口去 Verify
+  `shop.bulk_delete` / `device.purchase` 两种单据。现已接上：
+  - `POST /api/v1/shops/batch/delete`（须持 `shop.bulk_delete` 单据，单次核销）
+  - `POST /api/v1/devices/purchase`：新增 `count` 支持批量申购，金额由服务端按
+    套餐单价 × 月数 × 台数重算（**不能听客户端报**），超阈值必须持证；
+    客户端只要带了单据就一律校验，防止拿已核销/已拒绝的单据混过去。
 - **仍缺**：代理机构委托审批，需 `approval_flows` 表承载，属运营后台范围。
 
 ## 6. ~~审批工单的「待办通知」~~ → ✅ 已实现（notify Sink 定向推送）
@@ -107,6 +127,10 @@
   Sink 据此定向投递。**不是全团队广播**——否则大多数人点进去才发现无权处理。
 - 停用成员（membership 非 active）不推送。
 - **实测**：普通运营 0 条待办、运营主管收到待办、申请人只收到结果通知。
+- **补齐「过期」那一半（本轮）**：`iam.approval.expired` 事件此前只有常量和模板、
+  从来没有地方发出，`ExpireSweep` 只改状态 ⇒ 申请人的单据悄悄失效了自己却不知道。
+  现已补上事件投递（**风险等级必须是 medium**，notify Sink 会丢弃 low），
+  并对申请人定向通知；审批人不被这条打扰。
 - **仍缺**：仅站内 + 控制台两通道；邮件/短信/Webhook 需新增 Sender 实现。
 
 ## 7. 导出水印仅覆盖 CSV

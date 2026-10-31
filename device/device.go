@@ -62,9 +62,12 @@ type PurchaseInput struct {
 	Region       string
 	City         string
 	PeriodMonths int
-	Actor        iam.Subject
-	Terminal     eventbus.Terminal
-	URL          string
+	// Count 一次申购的台数（>1 即批量申购）。它的存在意义不只是省事：
+	// 大额申购是「双人复核」（会签）唯一的现实触发点——单台几十元的申购永远碰不到阈值。
+	Count    int
+	Actor    iam.Subject
+	Terminal eventbus.Terminal
+	URL      string
 }
 
 // Purchase 购买设备：配额校验 → 代理商分配 → 事务内写设备 + 计量 + 事件。
@@ -75,64 +78,100 @@ func (s *Service) Purchase(ctx context.Context, in PurchaseInput) (*types.Device
 	if in.PeriodMonths <= 0 {
 		in.PeriodMonths = 1
 	}
+	if in.Count <= 0 {
+		in.Count = 1
+	}
 	d := s.engine.Check(ctx, iam.Request{Subject: in.Actor, Action: "device:purchase", Path: "/devices"})
 	if !d.Allow {
 		return nil, apierr.Forbidden("无权购买设备（" + string(d.Layer) + "）")
 	}
-	if err := s.ent.CheckQuota(ctx, in.Actor.TenantID, billing.MetricDeviceCount, 1); err != nil {
+	if err := s.ent.CheckQuota(ctx, in.Actor.TenantID, billing.MetricDeviceCount, int64(in.Count)); err != nil {
 		return nil, err
 	}
 
-	deviceID := ids.New()
+	// 每台单独申请出口：多环境共用同一出口 IP 会被平台直接串号，
+	// 所以这里不是「申请一个再复用」，而是逐台分配（验收见 network/allocator.go 的排他约束）。
+	devs := make([]*types.Device, 0, in.Count)
 	now := time.Now().UTC()
-	proxy := (*network.AcquiredProxy)(nil)
-	if s.prov != nil {
-		acq, err := s.prov.Acquire(ctx, network.Region{Code: in.Country + "-" + in.City, Country: in.Country, City: in.City})
-		if err != nil {
-			return nil, err
+	for i := 0; i < in.Count; i++ {
+		deviceID := ids.New()
+		proxy := (*network.AcquiredProxy)(nil)
+		if s.prov != nil {
+			acq, err := s.prov.Acquire(ctx, network.Region{
+				Code: in.Country + "-" + in.City, Country: in.Country, City: in.City,
+			})
+			if err != nil {
+				return nil, err
+			}
+			proxy = acq
 		}
-		proxy = acq
-	}
-	dev := &types.Device{
-		ID: deviceID, TenantID: in.Actor.TenantID, Name: orDefault(in.Name, "设备-"+deviceID[:6]),
-		Type: in.Type, Country: in.Country, Region: in.Region, City: in.City,
-		Status: types.DeviceStatusAllocating, OwnerID: in.Actor.UserID,
-		MaxConcurrent: s.cfg.Limits.DeviceMaxConcurrentUsers,
-		ExpiresAt:     now.AddDate(0, in.PeriodMonths, 0),
-		CreatedAt:     now, UpdatedAt: now,
-	}
-	if proxy != nil {
-		dev.IP = proxy.Proxy.Host
-		dev.Protocol = string(proxy.Proxy.Protocol)
-		dev.ProxyHost = proxy.Proxy.Host
-		dev.ProxyPort = proxy.Proxy.Port
-		dev.ProxyUser = proxy.Proxy.Username
-		dev.ASNType = string(proxy.Proxy.ASNType)
-		dev.ExpiresAt = proxy.ExpiresAt
+		dev := &types.Device{
+			ID: deviceID, TenantID: in.Actor.TenantID,
+			Name: orDefault(in.Name, "设备-"+deviceID[:6]),
+			Type: in.Type, Country: in.Country, Region: in.Region, City: in.City,
+			Status: types.DeviceStatusAllocating, OwnerID: in.Actor.UserID,
+			MaxConcurrent: s.cfg.Limits.DeviceMaxConcurrentUsers,
+			ExpiresAt:     now.AddDate(0, in.PeriodMonths, 0),
+			CreatedAt:     now, UpdatedAt: now,
+		}
+		if proxy != nil {
+			dev.IP = proxy.Proxy.Host
+			dev.Protocol = string(proxy.Proxy.Protocol)
+			dev.ProxyHost = proxy.Proxy.Host
+			dev.ProxyPort = proxy.Proxy.Port
+			dev.ProxyUser = proxy.Proxy.Username
+			dev.ASNType = string(proxy.Proxy.ASNType)
+			dev.ExpiresAt = proxy.ExpiresAt
+		}
+		devs = append(devs, dev)
 	}
 
 	tctx := store.WithTenant(ctx, in.Actor.TenantID)
+	amount := PurchaseAmountCNY(ctx, s.ent, in.Actor.TenantID, in.PeriodMonths, in.Count)
 	if err := s.st.WithTx(tctx, func(tx store.Tx) error {
-		if err := tx.Devices().Create(tctx, dev); err != nil {
-			return err
+		for _, dev := range devs {
+			if err := tx.Devices().Create(tctx, dev); err != nil {
+				return err
+			}
 		}
-		if _, err := s.meter.Record(tctx, tx, in.Actor.TenantID, billing.MetricDeviceCount, 1); err != nil {
+		if _, err := s.meter.Record(tctx, tx, in.Actor.TenantID, billing.MetricDeviceCount, int64(in.Count)); err != nil {
 			return err
 		}
 		return s.bus.Emit(tctx, tx, eventbus.Event{
 			TenantID: in.Actor.TenantID, Type: TypeDevicePurchased, OccurredAt: now,
-			Actor: actorOf(in.Actor), Subject: eventbus.Subject{DeviceID: deviceID},
+			Actor: actorOf(in.Actor), Subject: eventbus.Subject{DeviceID: devs[0].ID},
 			Terminal: in.Terminal,
 			Context:  eventbus.ContextInfo{URL: in.URL, Action: "device.purchase", Result: "success"},
 			Data: map[string]any{
-				"device_id": deviceID, "type": string(in.Type),
+				"device_id": devs[0].ID, "type": string(in.Type),
 				"country": in.Country, "months": in.PeriodMonths,
+				"count": in.Count, "amount": amount,
 			},
 		})
 	}); err != nil {
 		return nil, err
 	}
-	return dev, nil
+	return devs[0], nil
+}
+
+// PurchaseAmountCNY 按套餐单价计算申购金额（元）：单价 × 月数 × 台数。
+//
+// 必须服务端算：审批路由靠它判断是否触发大额双人复核，听客户端自己报金额等于没控。
+// 取不到套餐时降级为 0（不因计费数据缺失卡住申购，也不凭空抬高风险等级）。
+func PurchaseAmountCNY(ctx context.Context, ent EntitlementQuerier, tenantID string, months, count int) float64 {
+	if ent == nil || months <= 0 || count <= 0 {
+		return 0
+	}
+	plan, err := ent.PlanOf(ctx, tenantID)
+	if err != nil {
+		return 0
+	}
+	return float64(plan.PricePerDevicePerMonth) / 100 * float64(months) * float64(count)
+}
+
+// EntitlementQuerier 套餐查询能力的最小子集（让金额计算不依赖整个 Entitlement）。
+type EntitlementQuerier interface {
+	PlanOf(ctx context.Context, tenantID string) (config.PlanSpec, error)
 }
 
 // ImportInput 自有设备导入（M3.2：代理设备 / 云服务器 VPS / 宽带设备）。

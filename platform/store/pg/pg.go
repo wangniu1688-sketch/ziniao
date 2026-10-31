@@ -368,7 +368,7 @@ func (r roleRepo) Create(ctx context.Context, role *types.Role) error {
 		if _, err := q.Exec(ctx, `INSERT INTO roles(id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 			role.ID, nullStr(role.TenantID), role.Code, role.Name, role.Builtin,
-			role.MaskFields, role.DenyElement, role.DataScope, role.CreatedAt); err != nil {
+			strArr(role.MaskFields), strArr(role.DenyElement), role.DataScope, role.CreatedAt); err != nil {
 			return wrapErr(err)
 		}
 		for _, p := range role.Permissions {
@@ -405,8 +405,15 @@ func (r roleRepo) GetByCode(ctx context.Context, tenantID, code string) (*types.
 	role := &types.Role{}
 	var tid *string
 	err := r.run(ctx, func(q querier) error {
+		// 命中顺序：先租户自定义角色，再系统内置角色（tenant_id IS NULL）。
+		//
+		// 修正（PG 实跑暴露）：原先写成 COALESCE(tenant_id,'~')=COALESCE($1,'~')，
+		// 传进租户 ID 时永远匹配不到系统级角色 ⇒ PG 上**任何授权都会报「角色不存在」**，
+		// 而 mem 实现允许回退到系统级角色，所以所有单元测试都是绿的——典型的
+		// 「测试替身与真实依赖语义不一致」导致的生产不可用。语义以 List 为准。
 		if err := q.QueryRow(ctx, `SELECT id,tenant_id,code,name,builtin,mask_fields,deny_elements,data_scope,created_at
-			FROM roles WHERE COALESCE(tenant_id,'~') = COALESCE($1,'~') AND code=$2`, nullStr(tenantID), code).
+			FROM roles WHERE code=$1 AND (tenant_id IS NULL OR tenant_id=$2)
+			ORDER BY CASE WHEN tenant_id IS NULL THEN 1 ELSE 0 END ASC LIMIT 1`, code, nullStr(tenantID)).
 			Scan(&role.ID, &tid, &role.Code, &role.Name, &role.Builtin,
 				&role.MaskFields, &role.DenyElement, &role.DataScope, &role.CreatedAt); err != nil {
 			return err
@@ -662,7 +669,7 @@ func (r shopRepo) Create(ctx context.Context, s *types.Shop) error {
 		_, err := q.Exec(ctx, `INSERT INTO shops(id,tenant_id,name,platform,site,status,group_name,tags,device_id,owner_id,profit,cost,balance,created_at,updated_at,deleted_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 			s.ID, s.TenantID, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status,
-			nullStr(s.Group), s.Tags, nullStr(s.DeviceID), s.OwnerID,
+			nullStr(s.Group), strArr(s.Tags), nullStr(s.DeviceID), s.OwnerID,
 			s.Profit, s.Cost, s.Balance, s.CreatedAt, s.UpdatedAt, s.DeletedAt)
 		return wrapErr(err)
 	})
@@ -743,7 +750,7 @@ func (r shopRepo) Update(ctx context.Context, s *types.Shop) error {
 			device_id=$9,owner_id=$10,profit=$11,cost=$12,balance=$13,updated_at=$14,deleted_at=$15
 			WHERE id=$1 AND tenant_id=$2`,
 			s.ID, tid, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status, nullStr(s.Group),
-			s.Tags, nullStr(s.DeviceID), s.OwnerID, s.Profit, s.Cost, s.Balance, s.UpdatedAt, s.DeletedAt)
+			strArr(s.Tags), nullStr(s.DeviceID), s.OwnerID, s.Profit, s.Cost, s.Balance, s.UpdatedAt, s.DeletedAt)
 		return err
 	}))
 }
@@ -1047,7 +1054,7 @@ func (r notifRepo) Create(ctx context.Context, n *types.Notification) error {
 	return r.run(ctx, func(q querier) error {
 		_, err := q.Exec(ctx, `INSERT INTO notifications(id,tenant_id,user_id,category,title,body,event_type,channels,created_at,read_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			n.ID, n.TenantID, n.UserID, n.Category, n.Title, n.Body, nullStr(n.EventType), n.Channels, n.CreatedAt, n.ReadAt)
+			n.ID, n.TenantID, n.UserID, n.Category, n.Title, n.Body, nullStr(n.EventType), strArr(n.Channels), n.CreatedAt, n.ReadAt)
 		return wrapErr(err)
 	})
 }
@@ -1090,6 +1097,20 @@ func (r notifRepo) MarkRead(ctx context.Context, tenantID, id string) error {
 func nullStr(s string) any {
 	if s == "" {
 		return nil
+	}
+	return s
+}
+
+// strArr 归一化写入 text[] NOT NULL 列的 Go 切片。
+//
+// 必要性（PG 实跑 0001/0002/0003 时暴露，mem 实现永远发现不了）：
+// Go 的 nil []string 经 pgx 编码为 SQL NULL，而列的 DEFAULT '{}' 只在 INSERT
+// **省略该列**时生效，显式写入 NULL 会直接触发 23502 not-null violation。
+// 典型触发者是 EnsureBuiltinRoles——除 finance 外所有内置角色的
+// MaskFields/DenyElement 都是 nil。
+func strArr(s []string) []string {
+	if s == nil {
+		return []string{}
 	}
 	return s
 }

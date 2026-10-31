@@ -38,9 +38,11 @@ type rule struct {
 
 // rulesOf 内置路由规则。顺序敏感：取**第一条**命中的规则。
 //
-// 关于 MinApprovers：目前全部为 1（单人审批），保持既有行为不变；
-// 会签的判定逻辑已经实现（见 decide 里的 quorum 分支），
-// 等规则可以由运营后台配置（approval_flows 表）后再开放 >1 的规则。
+// 关于 MinApprovers：大额设备申购为 2（双人复核），其余为 1。
+// 会签判定逻辑见 decide 里的 quorum 分支，生产入口是
+// 网关 `POST /api/v1/devices/purchase`（金额超阈值时必须持证）——
+// 也就是说，这条规则现在是真的会被执行到的，改动前请先看那条链路上的测试。
+// 规则数据要能由运营后台配置，还需 approval_flows 表（见 TODO-phase2 第 5 条）。
 func rulesOf(amountOwnerThreshold float64) []rule {
 	return []rule{
 		{

@@ -102,17 +102,23 @@ func (r approvalRepo) List(ctx context.Context, f store.ApprovalFilter) ([]types
 	if limit <= 0 {
 		limit = 50
 	}
+	if offset < 0 {
+		offset = 0
+	}
 	out := []types.ApprovalTicket{}
 	total := 0
 	err = r.run(ctx, func(q querier) error {
 		if err := q.QueryRow(ctx, `SELECT COUNT(*) FROM approval_tickets `+where, args...).Scan(&total); err != nil {
 			return err
 		}
+		// 修正（PG 实跑才发现）：原先 LIMIT/OFFSET 写的是占位符计数器 n 本身，
+		// 无过滤条件时 n=2 → 拼出 LIMIT 2 OFFSET 3，且多传的参数在 SQL 里没有对应占位符。
+		// 正确做法是继续用 $n/$n+1 占位并把 limit/offset 追加到参数尾部。
 		rows, err := q.Query(ctx, `SELECT id,type,COALESCE(subject_type,''),COALESCE(subject_id,''),
 			requester_id,COALESCE(requester_name,''),COALESCE(approver_id,''),COALESCE(approver_name,''),
 			COALESCE(reason,''),status,detail,expires_at,created_at,decided_at
 			FROM approval_tickets `+where+` ORDER BY created_at DESC
-			LIMIT `+itoa(n)+` OFFSET `+itoa(n+1), append(args, limit, offset)...)
+			LIMIT $`+itoa(n)+` OFFSET $`+itoa(n+1), append(args, limit, offset)...)
 		if err != nil {
 			return err
 		}
