@@ -16,6 +16,15 @@ var templates = map[string]Template{
 	"member.invited":    {"新成员加入", "团队成员发生变化"},
 	"risk.alert":        {"风险告警", "系统检测到风险事件"},
 	"usage.recorded":    {"用量提醒", "资源用量发生变化"},
+
+	// 审批待办：由 approval 服务算好的合格审批人定向推送（见 approverIDsOf），
+	// 避免全团队都收到、大多数人点进去才发现无权处理。
+	"iam.approval.created":  {"待办：审批单待处理", "有一条审批单等待你处理，请尽快裁决"},
+	"iam.approval.signed":   {"审批进度：已签署", "审批单收到一次签署，仍需剩余签署人确认"},
+	"iam.approval.approved": {"审批结果：已通过", "你关注的审批单已批准"},
+	"iam.approval.rejected": {"审批结果：已驳回", "你关注的审批单已被驳回"},
+	"iam.approval.expired":  {"审批结果：已过期", "审批单超时未处理，已自动失效"},
+	"iam.approval.used":     {"高危提示：审批单已核销", "审批单已被用于高危操作"},
 }
 
 // TemplateOf 取模板，未命中返回通用模板。

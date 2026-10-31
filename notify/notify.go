@@ -66,9 +66,9 @@ func NewSink(st store.Store, log *slog.Logger, senders ...Sender) *Sink {
 // Name 处理器名。
 func (s *Sink) Name() string { return "notify" }
 
-// Types 只订阅风险相关与任务类事件。
+// Types 订阅范围：风险类、部分 IAM 事件，以及**审批待办**（TODO 第 6 条）。
 func (s *Sink) Types() []string {
-	return []string{"risk.", "auth.login_failed", "shop.deleted", "iam.role.", "usage.recorded"}
+	return []string{"risk.", "auth.login_failed", "shop.deleted", "iam.role.", "usage.recorded", "iam.approval."}
 }
 
 // Handle 生成站内通知并外发到已启用通道。
@@ -77,7 +77,12 @@ func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 		return nil
 	}
 	tpl := TemplateOf(ev.Type)
+	// 审批类事件走定向推送：待办必须落到"真能批这批人的人"手上。
+	// 否则会出现全团队都收到提示、大多数人点进去才发现无权处理的噪音。
 	targets := s.resolveTargets(ctx, ev)
+	if ids, ok := approverIDsOf(ev); ok {
+		targets = ids
+	}
 	now := time.Now().UTC()
 	for _, userID := range targets {
 		n := &types.Notification{
@@ -108,6 +113,37 @@ func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 		}
 	}
 	return nil
+}
+
+// approverIDsOf 取出事件里定向的审批人名单。
+// 事件经 outbox JSON 往返后是 []any{string}，同进程直接投递时可能是 []string，两种都要认。
+func approverIDsOf(ev *eventbus.Event) ([]string, bool) {
+	if len(ev.Data) == 0 {
+		return nil, false
+	}
+	raw, ok := ev.Data["approver_ids"]
+	if !ok {
+		return nil, false
+	}
+	switch v := raw.(type) {
+	case []string:
+		out := []string{}
+		for _, id := range v {
+			if id != "" {
+				out = append(out, id)
+			}
+		}
+		return out, len(out) > 0
+	case []any:
+		out := []string{}
+		for _, item := range v {
+			if id, ok := item.(string); ok && id != "" {
+				out = append(out, id)
+			}
+		}
+		return out, len(out) > 0
+	}
+	return nil, false
 }
 
 // resolveTargets 通知对象：操作人本人 + 租户内老板/运营主管（安全事件需管理员知晓）。

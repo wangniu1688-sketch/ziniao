@@ -28,6 +28,8 @@ const (
 	TypeCancel   = "iam.approval.cancelled"
 	TypeExpired  = "iam.approval.expired"
 	TypeUsed     = "iam.approval.used"
+	// TypeSigned 会签中的一次签署（尚未达法定人数，工单仍是 pending）。
+	TypeSigned = "iam.approval.signed"
 )
 
 // Service 审批服务。
@@ -84,6 +86,16 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*types.ApprovalTi
 		Reason: in.Reason, Status: types.ApprovalPending, Detail: in.Detail,
 		ExpiresAt: now.Add(time.Duration(ttl) * time.Second), CreatedAt: now,
 	}
+	// 路由：算出这张单该由谁批。这里的名单用于待办定向推送——
+	// 审批待办必须落到"真能批这批人的人"手上，否则会变成所有人收到通知、
+	// 大多数点进去才发现无权处理。
+	tctxApprovers := store.WithTenant(ctx, in.Actor.TenantID)
+	approvers, _ := s.ResolveApprovers(tctxApprovers, in.Actor.TenantID, t)
+	approverIDs := make([]string, 0, len(approvers))
+	for _, a := range approvers {
+		approverIDs = append(approverIDs, a.UserID)
+	}
+	req := s.RequiredFor(t)
 	tctx := store.WithTenant(ctx, in.Actor.TenantID)
 	if err := s.st.WithTx(tctx, func(tx store.Tx) error {
 		if err := tx.Approvals().Create(tctx, t); err != nil {
@@ -94,7 +106,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*types.ApprovalTi
 			Actor:    eventbus.Actor{UserID: in.Actor.UserID, Username: in.Actor.Username, RoleCode: roleCodes(in.Actor)},
 			Terminal: in.Terminal,
 			Context:  eventbus.ContextInfo{URL: in.URL, Action: "approval.create", Result: "success"},
-			Data:     map[string]any{"ticket_id": t.ID, "type": t.Type, "subject_id": t.SubjectID},
+			Data: map[string]any{
+				"ticket_id": t.ID, "type": t.Type, "subject_id": t.SubjectID,
+				"approver_ids": approverIDs, "required_roles": req.Roles,
+				"min_approvers": req.MinApprovers, "requirement": req.Reason,
+			},
 		})
 	}); err != nil {
 		return nil, err
@@ -158,7 +174,64 @@ func (s *Service) decide(ctx context.Context, in DecideInput, status types.Appro
 	if t.RequesterID == in.Actor.UserID {
 		return nil, apierr.Forbidden("申请人与审批人不能是同一人（职责分离）")
 	}
+	// 路由准入：光有 approval:approve 权限不够，还得是这条单要求的角色。
+	// 否则一个普通运营就能批准「导出全量审计日志」「查看店铺主账号口令」。
+	if err := s.CanApprove(t, in.Actor); err != nil {
+		return nil, err
+	}
+	// 会签：未达法定人数前只记签署，工单保持 pending。
+	if status == types.ApprovalApproved {
+		if need := s.RequiredFor(t).MinApprovers; need > 1 {
+			sigs, ok := addSignature(t, in.Actor)
+			if !ok {
+				return nil, apierr.Conflict("你已签署该审批单，请勿重复操作")
+			}
+			if len(sigs) < need {
+				return s.recordSignature(ctx, t, in, len(sigs), need)
+			}
+		}
+	}
 	return s.finish(ctx, t, status, evType, action, in, eventbus.RiskHigh)
+}
+
+// recordSignature 记录一次会签签署（工单仍 pending）。
+func (s *Service) recordSignature(ctx context.Context, t *types.ApprovalTicket,
+	in DecideInput, got, need int) (*types.ApprovalTicket, error) {
+	now := time.Now().UTC()
+	tctx := store.WithTenant(ctx, in.Actor.TenantID)
+	if err := s.st.WithTx(tctx, func(tx store.Tx) error {
+		if err := tx.Approvals().Update(tctx, t); err != nil {
+			return err
+		}
+		return s.bus.Emit(tctx, tx, eventbus.Event{
+			TenantID: t.TenantID, Type: TypeSigned, OccurredAt: now, Risk: eventbus.RiskMedium,
+			Actor:    eventbus.Actor{UserID: in.Actor.UserID, Username: in.Actor.Username, RoleCode: roleCodes(in.Actor)},
+			Terminal: in.Terminal,
+			Context:  eventbus.ContextInfo{URL: in.URL, Action: "approval.sign", Result: "pending"},
+			Data: map[string]any{
+				"ticket_id": t.ID, "type": t.Type, "signed": got, "required": need,
+				// 剩余待批的人 -> 通知可以继续定向推给他们
+				"approver_ids": approverIDsExcept(t, in.Actor.UserID),
+			},
+		})
+	}); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// approverIDsExcept 取已签发这张单的 involved 名单里除某人外的其他人（用于继续推送待办）。
+func approverIDsExcept(t *types.ApprovalTicket, except string) []string {
+	out := []string{}
+	for _, s := range signaturesOf(t) {
+		if s.UserID != except {
+			out = append(out, s.UserID)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, t.RequesterID) // 无人可推时退回通知申请人进度
+	}
+	return out
 }
 
 func (s *Service) finish(ctx context.Context, t *types.ApprovalTicket, status types.ApprovalStatus,

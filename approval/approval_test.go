@@ -21,6 +21,8 @@ type env struct {
 	st     *mem.Store
 	owner  iam.Subject
 	leader iam.Subject
+	boss2  iam.Subject
+	staff  iam.Subject
 }
 
 func newEnv(t *testing.T) *env {
@@ -35,7 +37,11 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opRole, err := st.Roles().GetByCode(ctx, "", "operator")
+	opsRole, err := st.Roles().GetByCode(ctx, "", "ops_manager") // 运营主管
+	if err != nil {
+		t.Fatal(err)
+	}
+	opRole, err := st.Roles().GetByCode(ctx, "", "operator") // 普通运营（无高危审批权）
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +54,16 @@ func newEnv(t *testing.T) *env {
 			UserID: "u-owner", TenantID: "t1", Username: "owner", Roles: []types.Role{*ownerRole},
 		},
 		leader: iam.Subject{
-			UserID: "u-lead", TenantID: "t1", Username: "leader", Roles: []types.Role{*opRole},
+			UserID: "u-lead", TenantID: "t1", Username: "leader", Roles: []types.Role{*opsRole},
+		},
+		// boss2 第二位老板：老板自己申请的审计导出单不能自己批，需要另一位老板批
+		boss2: iam.Subject{
+			UserID: "u-boss2", TenantID: "t1", Username: "boss2", Roles: []types.Role{*ownerRole},
+		},
+		// staff 普通运营：有 approval:approve 权限但不是管理员，
+		// 用来验证「不是有权限就能批，还得是这条单要求的角色」
+		staff: iam.Subject{
+			UserID: "u-staff", TenantID: "t1", Username: "staff", Roles: []types.Role{*opRole},
 		},
 	}
 }

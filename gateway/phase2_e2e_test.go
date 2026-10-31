@@ -49,7 +49,8 @@ func TestPhase2ApprovalAndExport(t *testing.T) {
 	}
 	leadID, _ := body["id"].(string)
 	if st, body = do(t, "POST", srv.URL+"/api/v1/tenants/"+tenantID+"/members/"+leadID+"/roles", token,
-		map[string]any{"role": "operator"}); st != http.StatusOK {
+		// 审批主管必须名副其实：普通运营（operator）按路由规则无权批高危单据
+		map[string]any{"role": "ops_manager"}); st != http.StatusOK {
 		t.Fatalf("授权失败: %d %v", st, body)
 	}
 	st, body = do(t, "POST", srv.URL+"/api/v1/auth/login", "", map[string]any{
@@ -119,7 +120,30 @@ func TestPhase2ApprovalAndExport(t *testing.T) {
 		t.Fatalf("提交导出审批单失败: %d %v", st, body)
 	}
 	exportTicket, _ := body["id"].(string)
-	if st, _ = do(t, "POST", srv.URL+"/api/v1/approvals/"+exportTicket+"/approve", leadToken, map[string]any{}); st != http.StatusOK {
+	// 明文导出全量审计日志是最高危：运营主管也不够，且申请人自己不能批，
+	// 所以需要另一位老板。
+	st, body = do(t, "POST", srv.URL+"/api/v1/tenants/"+tenantID+"/members", token, map[string]any{
+		"username": "appr_boss2", "password": testPassword, "nickname": "第二位老板",
+	})
+	if st != http.StatusCreated {
+		t.Fatalf("邀请第二老板失败: %d %v", st, body)
+	}
+	boss2ID, _ := body["id"].(string)
+	if st, body = do(t, "POST", srv.URL+"/api/v1/tenants/"+tenantID+"/members/"+boss2ID+"/roles", token,
+		map[string]any{"role": "owner"}); st != http.StatusOK {
+		t.Fatalf("第二老板授权失败: %d %v", st, body)
+	}
+	st, body = do(t, "POST", srv.URL+"/api/v1/auth/login", "", map[string]any{
+		"username": "appr_boss2", "password": testPassword,
+	})
+	if st != http.StatusOK {
+		t.Fatalf("第二老板登录失败: %d %v", st, body)
+	}
+	boss2Token, _ := body["token"].(string)
+	if st, _ = do(t, "POST", srv.URL+"/api/v1/approvals/"+exportTicket+"/approve", leadToken, map[string]any{}); st == http.StatusOK {
+		t.Fatal("运营主管不应能批准明文导出全量审计日志（覆盖全团队操作记录）")
+	}
+	if st, _ = do(t, "POST", srv.URL+"/api/v1/approvals/"+exportTicket+"/approve", boss2Token, map[string]any{}); st != http.StatusOK {
 		t.Fatalf("导出审批失败: %d", st)
 	}
 	raw := httpGetRaw(t, srv.URL+"/api/v1/audit/logs/export?ticket="+exportTicket, token)
