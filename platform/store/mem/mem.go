@@ -761,3 +761,40 @@ func (r notifRepo) MarkRead(_ context.Context, tenantID, id string) error {
 	}
 	return notFound("notification", id)
 }
+
+// UpdateDelivery 只回写投递字段（与 pg 严格对齐：按 id + tenant_id 定位，
+// 找不到返回 404；标题正文一律不动）。
+func (r notifRepo) UpdateDelivery(_ context.Context, n *types.Notification) error {
+	for _, it := range r.s.notifs {
+		if it.ID == n.ID && it.TenantID == n.TenantID {
+			it.DeliveryStatus = n.DeliveryStatus
+			it.DeliveryNote = n.DeliveryNote
+			it.Attempts = n.Attempts
+			it.DeliveredChannels = n.DeliveredChannels
+			it.LastDeliveryAt = n.LastDeliveryAt
+			return nil
+		}
+	}
+	return notFound("notification", n.ID)
+}
+
+// ListPendingDelivery 与 pg 同源语义：只认 pending/failed，升序，limit<=0 取 100。
+func (r notifRepo) ListPendingDelivery(_ context.Context, tenantID string, limit int) ([]types.Notification, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	out := []types.Notification{}
+	for _, n := range r.s.notifs {
+		if n.TenantID != tenantID {
+			continue
+		}
+		if n.DeliveryStatus == "pending" || n.DeliveryStatus == "failed" {
+			out = append(out, *n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	if limit < len(out) {
+		out = out[:limit]
+	}
+	return out, nil
+}

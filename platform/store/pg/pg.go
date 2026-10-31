@@ -1085,12 +1085,36 @@ type notifRepo struct{ base }
 
 func (r notifRepo) Create(ctx context.Context, n *types.Notification) error {
 	return r.run(ctx, func(q querier) error {
-		_, err := q.Exec(ctx, `INSERT INTO notifications(id,tenant_id,user_id,category,title,body,event_type,channels,created_at,read_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			n.ID, n.TenantID, n.UserID, n.Category, n.Title, n.Body, nullStr(n.EventType), strArr(n.Channels), n.CreatedAt, n.ReadAt)
+		_, err := q.Exec(ctx, `INSERT INTO notifications(id,tenant_id,user_id,category,title,body,event_type,channels,created_at,read_at,
+			delivery_status,delivery_note,attempts,delivered_channels,last_delivery_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			n.ID, n.TenantID, n.UserID, n.Category, n.Title, n.Body, nullStr(n.EventType), strArr(n.Channels), n.CreatedAt, n.ReadAt,
+			nullStatus(n.DeliveryStatus), nullStr(n.DeliveryNote), n.Attempts, strArr(n.DeliveredChannels), n.LastDeliveryAt)
 		return wrapErr(err)
 	})
 }
+
+// scanNotif 通知行公共扫描（List 与 ListPendingDelivery 共用同一套列顺序）。
+func scanNotif(rows pgx.Rows) ([]types.Notification, error) {
+	out := []types.Notification{}
+	for rows.Next() {
+		var n types.Notification
+		if err := rows.Scan(&n.ID, &n.TenantID, &n.UserID, &n.Category, &n.Title, &n.Body,
+			&n.EventType, &n.Channels, &n.CreatedAt, &n.ReadAt,
+			&n.DeliveryStatus, &n.DeliveryNote, &n.Attempts, &n.DeliveredChannels, &n.LastDeliveryAt); err != nil {
+			return out, err
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+const notifColumns = `id,tenant_id,user_id,category,title,body,COALESCE(event_type,''),
+	channels,created_at,read_at,COALESCE(delivery_status,'none'),COALESCE(delivery_note,''),
+	attempts,delivered_channels,last_delivery_at`
 
 func (r notifRepo) List(ctx context.Context, tenantID, userID string, limit int) ([]types.Notification, error) {
 	if limit <= 0 {
@@ -1098,22 +1122,15 @@ func (r notifRepo) List(ctx context.Context, tenantID, userID string, limit int)
 	}
 	out := []types.Notification{}
 	err := r.run(ctx, func(q querier) error {
-		rows, err := q.Query(ctx, `SELECT id,tenant_id,user_id,category,title,body,COALESCE(event_type,''),
-			channels,created_at,read_at FROM notifications WHERE tenant_id=$1 AND user_id=$2
+		rows, err := q.Query(ctx, `SELECT `+notifColumns+` FROM notifications WHERE tenant_id=$1 AND user_id=$2
 			ORDER BY created_at DESC LIMIT $3`, tenantID, userID, limit)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
-		for rows.Next() {
-			var n types.Notification
-			if err := rows.Scan(&n.ID, &n.TenantID, &n.UserID, &n.Category, &n.Title, &n.Body,
-				&n.EventType, &n.Channels, &n.CreatedAt, &n.ReadAt); err != nil {
-				return err
-			}
-			out = append(out, n)
-		}
-		return rows.Err()
+		var serr error
+		out, serr = scanNotif(rows)
+		return serr
 	})
 	return out, wrapErr(err)
 }
@@ -1123,6 +1140,47 @@ func (r notifRepo) MarkRead(ctx context.Context, tenantID, id string) error {
 		_, err := q.Exec(ctx, `UPDATE notifications SET read_at=now() WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		return wrapErr(err)
 	})
+}
+
+// UpdateDelivery 回写投递结果。
+//
+// RowsAffected=0 必须当成「没找到」来处理，而不是静默成功：调用方（重投任务）
+// 据此判断这条通知是否已被删除/换租户，否则会对着空气反复投递。
+func (r notifRepo) UpdateDelivery(ctx context.Context, n *types.Notification) error {
+	return r.run(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx, `UPDATE notifications SET delivery_status=$1,delivery_note=$2,attempts=$3,
+			delivered_channels=$4,last_delivery_at=$5 WHERE tenant_id=$6 AND id=$7`,
+			nullStatus(n.DeliveryStatus), nullStr(n.DeliveryNote), n.Attempts,
+			strArr(n.DeliveredChannels), n.LastDeliveryAt, n.TenantID, n.ID)
+		if err != nil {
+			return wrapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return apierr.NotFound("记录不存在")
+		}
+		return nil
+	})
+}
+
+// ListPendingDelivery 待重投通知（与 mem 同语义：pending/failed，created_at 升序）。
+func (r notifRepo) ListPendingDelivery(ctx context.Context, tenantID string, limit int) ([]types.Notification, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	out := []types.Notification{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT `+notifColumns+` FROM notifications
+			WHERE tenant_id=$1 AND delivery_status IN ('pending','failed')
+			ORDER BY created_at ASC LIMIT $2`, tenantID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var serr error
+		out, serr = scanNotif(rows)
+		return serr
+	})
+	return out, wrapErr(err)
 }
 
 // ---------- 辅助 ----------
@@ -1137,6 +1195,15 @@ func nullStr(s string) any {
 // strArr 归一化写入 text[] NOT NULL 列的 Go 切片。
 //
 // 必要性（PG 实跑 0001/0002/0003 时暴露，mem 实现永远发现不了）：
+// nullStatus 投递状态兜底：表里另有 CHECK 约束，空字符串会被 PG 直接拒掉（23514），
+// 而 mem 允许任何字符串——这是两边最容易分叉的一处，写库前在这里统一。
+func nullStatus(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
 // Go 的 nil []string 经 pgx 编码为 SQL NULL，而列的 DEFAULT '{}' 只在 INSERT
 // **省略该列**时生效，显式写入 NULL 会直接触发 23502 not-null violation。
 // 典型触发者是 EnsureBuiltinRoles——除 finance 外所有内置角色的

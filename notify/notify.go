@@ -4,11 +4,14 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"ziniao/eventbus"
+	"ziniao/platform/config"
 	"ziniao/platform/ids"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
@@ -16,6 +19,7 @@ import (
 
 // Message 通知消息。
 type Message struct {
+	ID        string // 关联站内通知行的主键（投递结果回写用）
 	TenantID  string
 	UserID    string
 	Category  string // system|security|billing|task
@@ -23,7 +27,20 @@ type Message struct {
 	Body      string
 	Channels  []string
 	EventType string
+	To        string // 收件邮箱（邮件通道必需；查不到用户邮箱时为空）
+	CreatedAt time.Time
 }
+
+// 投递状态取值（migration 0006 的 CHECK 约束与之对应）。
+const (
+	StatusNone    = "none"    // 无外发通道或通道全被跳过
+	StatusPending = "pending" // 待投递 / 投递中
+	StatusSent    = "sent"    // 所有需要的通道均已送达
+	StatusFailed  = "failed"  // 仍有通道未送达（重投任务的输入）
+)
+
+// ChannelInApp 站内通道名。
+const ChannelInApp = "inapp"
 
 // Sender 通道驱动。
 type Sender interface {
@@ -50,9 +67,13 @@ type Sink struct {
 	st      store.Store
 	senders []Sender
 	log     *slog.Logger
+	policy  config.Notify // 外发策略（最低风险等级 + 重投上限）
 }
 
 // NewSink 构造通知落库与分发器。
+//
+// 不传 senders 时退回 console 驱动：dev/单测环境与改造前行为完全一致，
+// 不会因为没有配邮件就损失任何东西。
 func NewSink(st store.Store, log *slog.Logger, senders ...Sender) *Sink {
 	if log == nil {
 		log = slog.Default()
@@ -61,6 +82,173 @@ func NewSink(st store.Store, log *slog.Logger, senders ...Sender) *Sink {
 		senders = []Sender{ConsoleSender{log: log}}
 	}
 	return &Sink{st: st, senders: senders, log: log}
+}
+
+// UseConfig 应用外部通道策略。
+//
+// 为什么整段搬过来而不是抄两个字段：重投上限与最低风险等级各自都有默认值，
+// 一旦两边各写一份兜底值，改配置就会只有一半生效（申购阈值那次就是这么踩的）。
+func (s *Sink) UseConfig(cfg *config.Config) *Sink {
+	if cfg != nil {
+		s.policy = cfg.Notify
+	}
+	return s
+}
+
+// externalChannels 当前装配的所有外发通道（站内通道不算）。
+func (s *Sink) externalChannels() []string {
+	out := []string{}
+	for _, sd := range s.senders {
+		if sd == nil {
+			continue
+		}
+		if ch := sd.Channel(); ch != "" && ch != ChannelInApp {
+			out = append(out, ch)
+		}
+	}
+	return out
+}
+
+func (s *Sink) minRiskJudge(risk string) bool {
+	c := config.Config{Notify: s.policy}
+	if s.policy.MinRisk == "" { // 未注入配置时用与 config.Default 同一口径
+		c.Notify.MinRisk = config.Default().Notify.MinRisk
+	}
+	return c.NotifyDeliverable(risk)
+}
+
+func (s *Sink) attemptsLimit() int { return s.policy.AttemptsLimit() }
+
+// RetryTenant 重投该租户未送达的通知（`notify.delivery_retry` 任务入口）。
+//
+// 返回 (本轮成功送达条数, 已耗尽次数仍失败的条数)。
+// 只发「所需通道 ∩ 已装配通道 - 已送达通道」的差集：
+// 邮件已经发到对方邮箱了，却因为 Webhook 抖动再发一封，是最伤用户信任的做法。
+func (s *Sink) RetryTenant(ctx context.Context, tenantID string) (int, int, error) {
+	list, err := s.st.Notifications().ListPendingDelivery(store.WithTenant(ctx, tenantID), tenantID, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	ext := s.externalChannels()
+	sentNow, givenUp := 0, 0
+	for i := range list {
+		n := list[i]
+		remaining := pendingChannels(n.Channels, n.DeliveredChannels, ext)
+		switch {
+		case len(remaining) == 0:
+			// 通道全部送达但状态还没翻过来（上一次进程在写回前退出了）
+			n.DeliveryStatus = StatusSent
+			n.DeliveryNote = ""
+		case n.Attempts >= s.attemptsLimit():
+			n.DeliveryStatus = StatusFailed
+			n.DeliveryNote = truncate(fmt.Sprintf("已重试 %d 次仍未送达: %s", n.Attempts, strings.Join(remaining, ",")), 300)
+			givenUp++
+		default:
+			s.dispatch(ctx, &n, remaining)
+			if n.DeliveryStatus == StatusSent {
+				sentNow++
+			} else {
+				givenUp++
+			}
+		}
+		if err := s.st.Notifications().UpdateDelivery(store.WithTenant(ctx, tenantID), &n); err != nil {
+			// 单条写失败不影响其它行：把它留给下一轮，而不是让整个租户的重投停摆
+			s.log.Error("投递状态回写失败", "id", n.ID, "err", err)
+		}
+	}
+	return sentNow, givenUp, nil
+}
+
+// pendingChannels 尚未送达且当前仍装配了的外发通道。
+func pendingChannels(want, delivered, installed []string) []string {
+	done := map[string]bool{}
+	for _, c := range delivered {
+		done[c] = true
+	}
+	avail := map[string]bool{}
+	for _, c := range installed {
+		avail[c] = true
+	}
+	out := []string{}
+	for _, c := range want {
+		if c == ChannelInApp || done[c] || !avail[c] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// dispatch 按通道逐个投递并回写状态。
+//
+// Handle 不对投递失败返回 error：通知已经入库了，返回 error 会让 outbox
+// 重投**整条事件**、于是再生成一条一模一样的站内通知。投递失败的正确归宿是
+// 这一行的 delivery_status=failed，交给重投任务处理。
+func (s *Sink) dispatch(ctx context.Context, n *types.Notification, only []string) {
+	if len(only) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	n.Attempts++
+	n.LastDeliveryAt = &now
+	notes := []string{}
+	for _, ch := range only {
+		var sd Sender
+		for _, cand := range s.senders {
+			if cand != nil && cand.Channel() == ch {
+				sd = cand
+				break
+			}
+		}
+		if sd == nil {
+			continue // 通道已卸载（配置被撤），不算失败
+		}
+		m := Message{
+			ID: n.ID, TenantID: n.TenantID, UserID: n.UserID, Category: n.Category,
+			Title: n.Title, Body: n.Body, Channels: n.Channels, EventType: n.EventType,
+			CreatedAt: n.CreatedAt,
+		}
+		if ch == "email" {
+			m.To = recipientOf(ctx, s.st, n.UserID)
+		}
+		err := sd.Send(ctx, m)
+		switch {
+		case err == nil:
+			n.DeliveredChannels = append(n.DeliveredChannels, ch)
+		case errors.Is(err, ErrNoRecipient):
+			// 收件人为空是**终态**而非失败：用户没填邮箱，再重试一百次也没有。
+			// 计入 DeliveredChannels（语义为「该通道已终结」）以免它一直挂在板上。
+			s.log.Info("收件人为空，跳过该通道", "channel", ch, "user", n.UserID, "id", n.ID)
+			n.DeliveredChannels = append(n.DeliveredChannels, ch)
+		default:
+			s.log.Error("通知外发失败", "channel", ch, "id", n.ID, "err", err)
+			notes = append(notes, fmt.Sprintf("%s: %s", ch, err))
+		}
+	}
+	switch {
+	case len(notes) > 0:
+		n.DeliveryStatus = StatusFailed
+		n.DeliveryNote = truncate(strings.Join(notes, "；"), 300)
+	case len(n.DeliveredChannels) > 0:
+		n.DeliveryStatus = StatusSent
+		n.DeliveryNote = ""
+	default:
+		n.DeliveryStatus = StatusNone
+	}
+	// 结果必须回写，否则「发了没有」永远查不到。写失败只记日志：
+	// 通知本体已经入库，重投任务下一轮会兜住。
+	if err := s.st.Notifications().UpdateDelivery(ctx, n); err != nil {
+		s.log.Error("投递状态回写失败", "id", n.ID, "err", err)
+	}
+}
+
+// recipientOf 取用户邮箱；查不到就返回空（调用方据此跳过邮件通道）。
+func recipientOf(ctx context.Context, st store.Store, userID string) string {
+	u, err := st.Users().GetByID(ctx, userID)
+	if err != nil || u == nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Email)
 }
 
 // Name 处理器名。
@@ -84,33 +272,32 @@ func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 		targets = ids
 	}
 	now := time.Now().UTC()
+	// 外发通道按「当前装了什么」决定：没配邮件/Webhook 时清单里只有 console，
+	// 与改造前的行为一致（high 事件落 [inapp, console]）。
+	ext := s.externalChannels()
+	need := []string{}
+	if s.minRiskJudge(string(ev.Risk)) {
+		need = append(need, ext...)
+	}
 	for _, userID := range targets {
 		n := &types.Notification{
 			ID: ids.New(), TenantID: ev.TenantID, UserID: userID,
 			Category: categoryOf(ev), Title: tpl.Title,
 			Body:      fmt.Sprintf("%s（%s，结果=%s，终端IP=%s）", tpl.Body, ev.Context.Action, ev.Context.Result, ev.Terminal.IP),
-			EventType: ev.Type, Channels: []string{"inapp"}, CreatedAt: now,
+			EventType: ev.Type, Channels: append([]string{ChannelInApp}, need...), CreatedAt: now,
+			DeliveryStatus: StatusNone,
 		}
-		if ev.Risk == eventbus.RiskHigh {
-			n.Channels = append(n.Channels, "console")
+		if len(need) > 0 {
+			n.DeliveryStatus = StatusPending
 		}
 		// 通知写入受 RLS 保护，必须在带租户上下文的事务内完成
 		if err := s.st.Notifications().Create(store.WithTenant(ctx, ev.TenantID), n); err != nil {
 			return err
 		}
-		for _, sender := range s.senders {
-			for _, ch := range n.Channels {
-				if sender.Channel() != ch {
-					continue
-				}
-				if err := sender.Send(ctx, Message{
-					TenantID: ev.TenantID, UserID: userID, Category: n.Category,
-					Title: n.Title, Body: n.Body, Channels: n.Channels, EventType: ev.Type,
-				}); err != nil {
-					s.log.Error("通知外发失败", "channel", ch, "err", err)
-				}
-			}
-		}
+		// 外发失败不向上抛错：站内通知已入库，抛错会让 outbox 重投整条事件、
+		// 于是再生成一条一模一样的站内通知。失败留在 delivery_status 上，
+		// 由 notify.delivery_retry 继续。
+		s.dispatch(store.WithTenant(ctx, ev.TenantID), n, need)
 	}
 	return nil
 }

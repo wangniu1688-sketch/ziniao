@@ -144,7 +144,10 @@
   从来没有地方发出，`ExpireSweep` 只改状态 ⇒ 申请人的单据悄悄失效了自己却不知道。
   现已补上事件投递（**风险等级必须是 medium**，notify Sink 会丢弃 low），
   并对申请人定向通知；审批人不被这条打扰。
-- **仍缺**：仅站内 + 控制台两通道；邮件/短信/Webhook 需新增 Sender 实现。
+- **补齐外发通道（本轮）**：邮件（SMTP）与 Webhook 两个 Sender 已实装，含投递留痕、
+  失败重投任务与控制台状态展示——详见第 12 条。
+- **仍缺**：短信通道；企微/飞书/钉钉目前走通用 Webhook 载荷（JSON + HMAC 签名头），
+  没有按各家自己的卡片格式与加签协议单独适配。
 
 ## 7. 导出水印仅覆盖 CSV
 
@@ -245,3 +248,64 @@
   绑定历史留档（当前只有「当前绑定」，做「历史共用同一 ASN」关联检测需要事件化）；
   环境停用/删除尚无服务端入口，因此 `Allocator.Release`（解绑 + 归还）目前只有
   「到期 sweep」这一条实际触发路径——建了入口后应在那里调用它，别等租约到期。
+
+## 12. ~~通知只有站内 + 控制台两通道~~ → ✅ 已交付 SMTP 邮件 + Webhook（含投递留痕与重投）
+
+- **为什么先做它**：上一轮的痛点是「出口轮换这种 high 级事件没人盯着控制台就看不见」。
+  站内通知解决的是「写进了数据库」，不解决「人收到了」——中间这一公里以前完全空白。
+- **两个 Sender**（`notify/smtp.go` / `notify/webhook.go`）：
+  - 邮件：`STARTTLS` 协商失败**直接报错**，不降级明文（告警正文带租户/站点/操作结果；
+    且标准库 `PlainAuth` 本身也拒绝明文发口令）。主题 RFC 2047 + 正文 base64，
+    保证中文告警穿过老旧的 7bit 中继。
+  - Webhook：JSON 载荷 + `X-Ziniao-Signature: sha256=<HMAC(ts+"."+body)>`。
+    签名**带时间戳**是为了让接收方能拒重放——一条被重放的「出口 IP 已轮换」
+    足以把运营引到完全错误的处置路径上。5xx/429/连接错误重试并退避，
+    4xx 不重试（再试多少次都一样）。
+- **SSRF 拦在 dial 层，不是拦 URL 字面量**：只看 URL 挡不住「域名先解析到公网、
+  真正连接时解析到 127.0.0.1」的 DNS rebinding，也挡不住配错到云元数据地址
+  （169.254.169.254）。`newSafeTransport` 在每次建立连接前逐个检查解析结果，
+  内网/链路本地/组播/CGNAT 一律拒绝；本地自测由 `ZINIAO_WEBHOOK_ALLOW_LOOPBACK` 显式放开。
+- **投递留痕（`notifications` 加列，migration 0006）**：
+  `delivery_status`（none/pending/sent/failed）+ `delivery_note` + `attempts` +
+  `delivered_channels` + `last_delivery_at`。没这张表状态，「这条 high 告警到底发没发到」
+  就永远只能靠翻日志猜。
+  - **Handle 对外发失败不返回 error**：通知已入库，返回 error 会让 outbox 重投**整条事件**、
+    于是再生成一条一模一样的站内通知（测试 `TestDeliveryFailureDoesNotDuplicateNotification`
+    锁住了这条）。失败的正确归宿是这一行的 `failed`，交给重投任务。
+  - **DeliveredChannels 的语义是「已终结」而非「已成功」**：用户没填邮箱时邮件通道
+    被跳过（`ErrNoRecipient`），这种情况必须记进来，否则重投任务会把「没邮箱的人」
+    当成「投递失败的人」，每轮重试一次直到耗尽次数，最后还是假的 failed——
+    这类假失败会把真正需要人看的告警淹没掉。
+- **重投任务 `notify.delivery_retry`（5m）**：只发「所需通道 ∩ 已装配通道 − 已终结通道」的差集。
+  邮件已经到了对方邮箱，却因为 Webhook 抖动再发一封，是最伤用户信任的做法。
+  `attempts` 达 `MaxAttempts`（默认 3）后置 `failed` 并停手，不再无限增长。
+- **默认只放行 high**（`ZINIAO_NOTIFY_MIN_RISK`）：medium（用量提醒等）量大且不需要立刻处理，
+  全推向邮箱只会让人把整个通道静音——那等于连 high 告警一起失去。
+- **配置口径**：`platform/config` 的 `Notify` 段 + `AttemptsLimit()` 单一取值方法。
+  环境变量：`ZINIAO_SMTP_HOST/PORT/USER/PASS/FROM/TLS_MODE/TIMEOUT`、
+  `ZINIAO_WEBHOOK_URL/SECRET/TIMEOUT/MAX_RETRY/ALLOW_LOOPBACK`、
+  `ZINIAO_NOTIFY_MAX_ATTEMPTS/MIN_RISK`。**口令与签名密钥只走环境变量**，
+  不进 argv（wmic 可读命令行）、不进日志、不在任何 API 响应里出现。
+- **实测**：
+  - `notify/smtp_test.go`：自写了最小 SMTP 服务器（不是 mock Send）——中文主题确认为 RFC 2047
+    编码、正文 base64 可解、RCPT/MAIL FROM 正确；无收件人返回 `ErrNoRecipient`；
+    明文连接带口令被拒且不泄露口令；STARTTLS 协商失败不降级明文；Health 真的 dial 一次。
+  - `notify/webhook_test.go`：签名可被接收方独立验算；503 重试到第 3 次成功；
+    404 只请求 1 次；429 重试但带退避；默认拦截 loopback 目标；超时受控。
+  - `notify/dispatch_test.go`：high 事件落到全部外发通道且状态为 sent；medium 不外发；
+    失败标记 failed 且不重复生成通知；无邮箱时邮件跳过、整体仍 sent；
+    重投只补未送达通道；attempts 耗尽后停手。
+  - **端到端** `app/notify_delivery_test.go`（真 `app.New` + 真 `config.Load()` + httptest）：
+    环境变量 → BuildSenders → Sink → Webhook 500 → 留下 failed → 恢复后 `RunJobsOnce`
+    补投成功 → 状态转 sent 且再跑一轮不重复投递。这条用例专门防「每处都对、拼起来不对」。
+  - **PG 16.15 实跑** `platform/store/pg/notif_test.go`（默认 skip）：迁移 0006 应用；
+    nil/空 `[]string` 写入 `text[] NOT NULL` 不触发 23502（即 egress 那次踩过的 NULL 坑，
+    这里靠 `strArr` 兜底且由真库验证）；非法 `delivery_status` 被 CHECK 拒绝且不落库；
+    `ListPendingDelivery` 只取 pending/failed 且按 `created_at` 升序；回写不改标题正文。
+- **控制台**：通知中心新增「外发」一列（已外发 / 投递中 / 外发失败 + 失败原因 tooltip / 仅站内），
+  把「站内已通知」与「人真的收到了」区分开。
+- **仍缺**：短信通道；企微/飞书/钉钉按各家的卡片格式与加签协议单独适配
+  （当前是通用 JSON 载荷 + HMAC 签名头，机器人接收方需自行解析）；
+  投递幂等目前依赖对方按 `id` 去重（同一通知每个通道至多成功一次，但跨进程故障切换时
+  存在「投递成功而状态未回写」的窗口，此时会重发一次——这也是 `delivered_channels`
+  之所以要落库的原因；接收侧的幂等表仍未建）。

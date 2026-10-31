@@ -472,4 +472,13 @@ type Notification struct {
 	Channels  []string   `json:"channels"`
 	CreatedAt time.Time  `json:"created_at"`
 	ReadAt    *time.Time `json:"read_at,omitempty"`
+
+	// 外发投递留痕（migration 0006）。
+	// 站内通知「写进去了」不等于「人看见了」——high 告警的价值全在最后一公里，
+	// 所以外发结果必须和通知本体同生共死，未送达的行留给重投任务继续尝试。
+	DeliveryStatus    string     `json:"delivery_status"`              // none|pending|sent|failed
+	DeliveryNote      string     `json:"delivery_note,omitempty"`      // 失败摘要（L4：不得含密钥/令牌）
+	Attempts          int        `json:"attempts"`                     // 累计尝试次数（含首次）
+	DeliveredChannels []string   `json:"delivered_channels,omitempty"` // 已成功送达的通道
+	LastDeliveryAt    *time.Time `json:"last_delivery_at,omitempty"`
 }

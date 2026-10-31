@@ -639,12 +639,25 @@ async function exportAudit() {
 }
 
 /* ---------- 通知 ---------- */
+// 外发一列是「站内已通知」和「人真的收到了」的唯一区别：
+// 只 channels 里写着 email/webhook 并不能证明送达，要看 delivery_status。
+function deliveryTag(n) {
+  const ch = (n.delivered_channels || []).join("、");
+  switch (n.delivery_status) {
+    case "sent":    return `<span class="badge ok" title="已送达通道：${esc(ch)}">已外发</span>`;
+    case "failed":  return `<span class="badge err" title="${esc(n.delivery_note || "外发失败")}">外发失败</span>`;
+    case "pending": return `<span class="badge warn" title="将在下一轮重投，已尝试 ${n.attempts || 0} 次">投递中</span>`;
+    default:        return `<span class="muted small">仅站内</span>`;
+  }
+}
+
 async function renderNotifications(c) {
   const data = await GET("/api/v1/notifications?limit=50");
   c.innerHTML = (data.items || []).length
-    ? `<div class="card"><table><tr><th>时间</th><th>类别</th><th>标题</th><th>内容</th><th>操作</th></tr>` +
+    ? `<div class="card"><table><tr><th>时间</th><th>类别</th><th>标题</th><th>内容</th><th>外发</th><th>操作</th></tr>` +
       data.items.map(n => `<tr><td class="small">${fmt(n.created_at)}</td><td>${esc(n.category)}</td>
         <td>${esc(n.title)}</td><td class="small">${esc(n.body)}</td>
+        <td class="small">${deliveryTag(n)}</td>
         <td>${n.read_at ? `<span class="muted small">已读</span>` : `<button onclick="readNotif('${n.id}')">标记已读</button>`}</td></tr>`).join("") + `</table></div>`
     : `<p class="muted">暂无通知</p>`;
 }

@@ -94,7 +94,19 @@ func (s egressSweeper) SweepTenant(ctx context.Context, tenantID string, now tim
 	return pool.SweepTenant(ctx, tenantID, now)
 }
 
-// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收 / 出口绑定回收）。
+type notifyRetryer struct{ a *App }
+
+// RetryTenant 补发该租户尚未送达的通知。
+// 没装配 Sink（极简测试脚手架）时什么都不做——重投只是尽力而为，
+// 不能因为缺的对象让整个 scheduler 报 error。
+func (n notifyRetryer) RetryTenant(ctx context.Context, tenantID string) (int, int, error) {
+	if n.a.NotifySink == nil {
+		return 0, 0, nil
+	}
+	return n.a.NotifySink.RetryTenant(ctx, tenantID)
+}
+
+// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收 / 出口绑定回收 / 通知重投）。
 func (a *App) wireJobs() {
 	cfg := a.Config
 	sched := jobs.NewScheduler(tenantLister{st: a.Store}, a.Log)
@@ -105,6 +117,7 @@ func (a *App) wireJobs() {
 		jobs.NewApprovalJanitor(approvalSweeper{a: a}),
 		jobs.NewTempGrantJanitor(grantReaper{a: a}),
 		jobs.NewEgressJanitor(egressSweeper{a: a}),
+		jobs.NewNotifyJanitor(notifyRetryer{a: a}),
 	)
 	a.Jobs = sched
 }

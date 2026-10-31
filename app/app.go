@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -40,6 +41,7 @@ type App struct {
 	Shop        *shop.Service
 	Audit       *audit.Service
 	Notify      *notify.Service
+	NotifySink  *notify.Sink // 事件 → 站内通知 + 外发（重投任务要拿它补发）
 	Meter       *billing.Meter
 	Entitlement *billing.Entitlement
 
@@ -69,7 +71,14 @@ func New(ctx context.Context, cfg *config.Config, st store.Store, log *slog.Logg
 	}
 	bus := eventbus.New(st, cfg, log)
 	bus.Register(audit.NewSink(st))
-	bus.Register(notify.NewSink(st, log))
+	// 外发通道（邮件/Webhook）按环境配置装配；配置非法时拒绝启动，
+	// 而不是启动后发现 high 告警一条都没出去。
+	senders, err := notify.BuildSenders(cfg, log)
+	if err != nil {
+		return nil, fmt.Errorf("app: 通知通道装配失败: %w", err)
+	}
+	sink := notify.NewSink(st, log, senders...).UseConfig(cfg)
+	bus.Register(sink)
 
 	meter := billing.NewMeter(st)
 	ent := billing.NewEntitlement(st, cfg)
@@ -80,6 +89,7 @@ func New(ctx context.Context, cfg *config.Config, st store.Store, log *slog.Logg
 		Identity:    identity.NewService(st, bus, cfg, ent),
 		Audit:       audit.NewService(st),
 		Notify:      notify.NewService(st),
+		NotifySink:  sink,
 		Meter:       meter,
 		Entitlement: ent,
 	}

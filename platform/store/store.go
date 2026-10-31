@@ -179,6 +179,13 @@ type NotificationRepo interface {
 	Create(ctx context.Context, n *types.Notification) error
 	List(ctx context.Context, tenantID, userID string, limit int) ([]types.Notification, error)
 	MarkRead(ctx context.Context, tenantID, id string) error
+	// UpdateDelivery 回写投递结果（id + tenant_id 双重定位）。
+	// 只更新 COLUMN delivery_* / attempts / delivered_channels / last_delivery_at，
+	// 不碰标题正文——重投时手里拿的可能是一份旧快照。
+	UpdateDelivery(ctx context.Context, n *types.Notification) error
+	// ListPendingDelivery 待重投通知：delivery_status ∈ (pending, failed)，按创建时间升序。
+	// limit<=0 时取 100。注意调用方必须带租户上下文（RLS），本接口不做跨租户兜底。
+	ListPendingDelivery(ctx context.Context, tenantID string, limit int) ([]types.Notification, error)
 }
 
 // ---------- Phase 1：设备 / 网络 / 环境 / 安全 / 凭证托管 ----------

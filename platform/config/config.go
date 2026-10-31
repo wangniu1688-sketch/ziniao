@@ -78,6 +78,30 @@ type Limits struct {
 	RecordingSegmentSeconds    int `key:"replay.segment_seconds"`     // 30
 }
 
+// Notify 通知外发通道配置。
+//
+// L4：SMTP 口令与 Webhook 签名密钥只经环境变量注入，不进 argv（wmic 可读命令行）、
+// 不进日志、不出现在任何 API 响应里——与 ZINIAO_IP_TOKEN 同一口径。
+// 通道未配置即视为关闭：宁可不发，也不发到一个「看起来配过」的地址上。
+type Notify struct {
+	SMTPHost    string        `key:"notify.smtp_host"` // 留空 = 邮件通道关闭
+	SMTPPort    int           `key:"notify.smtp_port"`
+	SMTPUser    string        `key:"notify.smtp_user"`
+	SMTPPass    string        `key:"notify.smtp_pass"`
+	SMTPFrom    string        `key:"notify.smtp_from"`     // 留空则回落到 SMTPUser
+	SMTPTLSMode string        `key:"notify.smtp_tls_mode"` // starttls|tls|none
+	SMTPTimeout time.Duration `key:"notify.smtp_timeout"`
+
+	WebhookURL           string        `key:"notify.webhook_url"` // 留空 = Webhook 通道关闭
+	WebhookSecret        string        `key:"notify.webhook_secret"`
+	WebhookTimeout       time.Duration `key:"notify.webhook_timeout"`
+	WebhookMaxRetry      int           `key:"notify.webhook_max_retry"`
+	WebhookAllowLoopback bool          `key:"notify.webhook_allow_loopback"` // dev/local only
+
+	MaxAttempts int    // 含首次在内的单通道投递上限，超过后留给重投任务并最终置 failed
+	MinRisk     string // high（默认）| medium
+}
+
 // Config 进程级配置。
 type Config struct {
 	Env         string `key:"env"` // dev|test|prod
@@ -93,6 +117,7 @@ type Config struct {
 	DispatcherMaxRetry  int           `key:"bus.max_retry"`
 	JobInterval         time.Duration `key:"job.interval"` // 定时巡检间隔
 	Limits              Limits
+	Notify              Notify // 外发通道（邮件/Webhook），未配即关闭
 }
 
 // Default 返回带合理默认值的配置（未标注规格数值的部分按 TODO 处理）。
@@ -146,6 +171,17 @@ func Default() *Config {
 			RecordingRetentionDaysFree: 7,
 			RecordingSegmentSeconds:    30,
 		},
+		// 外发通道默认全关：配了才有 or 没有，不存在"半配置"。
+		Notify: Notify{
+			SMTPPort:        587, // 587=STARTTLS（Submission），465=隐式 TLS
+			SMTPTLSMode:     "starttls",
+			SMTPTimeout:     10 * time.Second,
+			WebhookURL:      "",
+			WebhookTimeout:  5 * time.Second,
+			WebhookMaxRetry: 2,
+			MaxAttempts:     3,
+			MinRisk:         "high",
+		},
 	}
 }
 
@@ -170,7 +206,64 @@ func Load() *Config {
 	l.ExportMaxRows = envInt("ZINIAO_LIMIT_EXPORT_MAX_ROWS", l.ExportMaxRows)
 	l.APIRatePerMinute = envInt("ZINIAO_LIMIT_API_RATE_PER_MINUTE", l.APIRatePerMinute)
 	l.DevicePurchaseOwnerThresholdCNY = envFloat("ZINIAO_LIMIT_DEVICE_PURCHASE_THRESHOLD_CNY", l.DevicePurchaseOwnerThresholdCNY)
+	// 外发通道：凭据只走环境变量（详见 Notify 注释）
+	n := &c.Notify
+	n.SMTPHost = envStr("ZINIAO_SMTP_HOST", n.SMTPHost)
+	n.SMTPPort = envInt("ZINIAO_SMTP_PORT", n.SMTPPort)
+	n.SMTPUser = envStr("ZINIAO_SMTP_USER", n.SMTPUser)
+	n.SMTPPass = envStr("ZINIAO_SMTP_PASS", n.SMTPPass)
+	n.SMTPFrom = envStr("ZINIAO_SMTP_FROM", n.SMTPFrom)
+	n.SMTPTLSMode = envStr("ZINIAO_SMTP_TLS_MODE", n.SMTPTLSMode)
+	n.SMTPTimeout = envDur("ZINIAO_SMTP_TIMEOUT", n.SMTPTimeout)
+	n.WebhookURL = envStr("ZINIAO_WEBHOOK_URL", n.WebhookURL)
+	n.WebhookSecret = envStr("ZINIAO_WEBHOOK_SECRET", n.WebhookSecret)
+	n.WebhookTimeout = envDur("ZINIAO_WEBHOOK_TIMEOUT", n.WebhookTimeout)
+	n.WebhookMaxRetry = envInt("ZINIAO_WEBHOOK_MAX_RETRY", n.WebhookMaxRetry)
+	n.WebhookAllowLoopback = envBool("ZINIAO_WEBHOOK_ALLOW_LOOPBACK", n.WebhookAllowLoopback)
+	n.MaxAttempts = envInt("ZINIAO_NOTIFY_MAX_ATTEMPTS", n.MaxAttempts)
+	n.MinRisk = envStr("ZINIAO_NOTIFY_MIN_RISK", n.MinRisk)
 	return c
+}
+
+// NotifyChannels 当前配置下**真正可用**的外发通道（顺序固定，便于断言与展示）。
+//
+// 返回值用于决定通知行要不要带某个通道标记；未配置时返回空切片，
+// notify 包据此退回 console 驱动（dev 行为与改动前完全一致）。
+func (c Config) NotifyChannels() []string {
+	out := []string{}
+	if n := c.Notify; n.SMTPHost != "" {
+		out = append(out, "email")
+	}
+	if n := c.Notify; n.WebhookURL != "" {
+		out = append(out, "webhook")
+	}
+	return out
+}
+
+// NotifyDeliverable 该风险等级的事件是否值得打扰人。
+//
+// 默认只放行 high：medium 事件（如 `usage.recorded`）量大且不需要立刻处理，
+// 全部推到邮箱/IM 只会让人把通知当作噪音静音——那等同于连 high 告警一起失去。
+func (c Config) NotifyDeliverable(risk string) bool {
+	switch strings.ToLower(strings.TrimSpace(c.Notify.MinRisk)) {
+	case "medium":
+		return risk == "medium" || risk == "high"
+	case "critical":
+		return false // 当前事件模型里没有比 high 更高的等级，等于只留 inapp
+	default:
+		return risk == "high"
+	}
+}
+
+// AttemptsLimit 单通道投递次数上限的取值口径（含首次）。
+//
+// 与 PurchaseOwnerThresholdCNY 同理：不要让业务代码各自兜底 3，
+// 否则"改了配置只有一半生效"。
+func (n Notify) AttemptsLimit() int {
+	if n.MaxAttempts > 0 {
+		return n.MaxAttempts
+	}
+	return 3
 }
 
 // defaultPurchaseOwnerThresholdCNY 设备申购双人复核阈值的内置兜底值（元）。
