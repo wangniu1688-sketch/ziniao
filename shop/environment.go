@@ -9,6 +9,7 @@ import (
 	"ziniao/eventbus"
 	"ziniao/fingerprint"
 	"ziniao/iam"
+	"ziniao/network"
 	"ziniao/platform/apierr"
 	"ziniao/platform/ids"
 	"ziniao/platform/store"
@@ -23,7 +24,16 @@ type EnvService struct {
 	engine   *iam.Engine
 	lib      *fingerprint.Library
 	baseline *fingerprint.BaselineLibrary
+	// pool 出口 IP 资源池（可选）。未配置时环境直连本机出口——
+	// **本机单IP 无法做多账号隔离**，生产必须配置。
+	pool *network.Allocator
 }
+
+// SetIPPool 接入 IP 资源池（由 -ip-base-url 等参数在启动时装配）。
+func (s *EnvService) SetIPPool(a *network.Allocator) { s.pool = a }
+
+// IPPool 当前出口 IP 池（可能为 nil，用于 healthz 展示编排状态）。
+func (s *EnvService) IPPool() *network.Allocator { return s.pool }
 
 // NewEnvService 构造环境服务。
 func NewEnvService(st store.Store, bus *eventbus.Bus, engine *iam.Engine,
@@ -142,6 +152,22 @@ type LaunchSpec struct {
 	ScriptBytes  int               `json:"script_bytes"`
 	OpenURL      string            `json:"open_url"`
 	Snapshot     map[string]string `json:"snapshot,omitempty"`
+	// Upstream **本环境专属**的出口代理凭据。
+	// 为什么必须逐环境下发：同一客户端进程里若所有窗口共用一组 ZINIAO_UPSTREAM_*
+	// 环境变量，就等于所有店铺共用同一个出口 IP——平台据此可直接把账号串起来。
+	// 凭据不经审计、不进 argv，只由客户端注入 sidecar 子进程的环境变量。
+	Upstream *UpstreamCredential `json:"upstream,omitempty"`
+}
+
+// UpstreamCredential 下发给人客户端的出口代理凭据。
+type UpstreamCredential struct {
+	Protocol string `json:"protocol"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Country  string `json:"country,omitempty"`
+	City     string `json:"city,omitempty"`
 }
 
 // Launch 下发环境启动单（真实浏览器窗口的能力源）。
@@ -168,6 +194,28 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 	if sp, err2 := s.st.Shops().Get(tctx, in.ShopID); err2 == nil && sp != nil {
 		shopName = sp.Name
 	}
+	// 出口 IP 分配：**失败必须拒绝启动，不能退回直连**。
+	// 直连意味着所有店铺共用本机这一个公网 IP，比共用代理商 IP 还糟；
+	// 宁可让这个环境起不来，也不能把账号暴露在关联风险里。
+	var upstream *UpstreamCredential
+	if s.pool != nil {
+		country := env.Snapshot["country"]
+		res, allocErr := s.pool.Allocate(ctx, env.ID, network.Region{
+			Country: country, ASNType: network.ASNResidential,
+		})
+		if allocErr != nil {
+			return nil, apierr.Internal("出口 IP 分配失败: " + allocErr.Error())
+		}
+		upstream = &UpstreamCredential{
+			Protocol: string(res.Protocol),
+			Host:     res.Host,
+			Port:     res.Port,
+			Username: res.Username,
+			Password: res.Password, // 口令只随本次启动单下发，不进审计、不落库
+			Country:  res.Country,
+			City:     res.City,
+		}
+	}
 	spec := &LaunchSpec{
 		EnvID:        env.ID,
 		ShopID:       env.ShopID,
@@ -182,6 +230,7 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 		ScriptBytes:  len(script),
 		OpenURL:      in.OpenURL,
 		Snapshot:     env.Snapshot,
+		Upstream:     upstream,
 	}
 	// 启动也是一次受管控的操作：写审计（不含凭证、不含脚本正文）
 	now := time.Now().UTC()

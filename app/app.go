@@ -165,6 +165,38 @@ func (a *App) wirePhase1() {
 	a.Vault = shop.NewVault(st, bus, engine, cipher)
 }
 
+// SetIPPool 接入住宅代理商的出口 IP 池。
+//
+// 这是多账号防关联的**最后一块拼图**：不配池子时所有店铺都从本机公网 IP 出网，
+// 平台一眼就能把账号串起来——画像再像、指纹再散都白费。
+func (a *App) SetIPPool(alloc *network.Allocator) { a.Environments.SetIPPool(alloc) }
+
+// StartIPReaper 周期回收过期的出口资源：既避免代理商持续计费，
+// 也防止本地绑定表随环境反复启停而膨胀。
+func (a *App) StartIPReaper(ctx context.Context, every time.Duration) {
+	pool := a.Environments.IPPool()
+	if pool == nil {
+		return
+	}
+	if every <= 0 {
+		every = 10 * time.Minute
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n := pool.Reap(ctx); n > 0 {
+					a.Log.Info("已回收过期出口资源", "count", n, "provider", pool.Provider().Name())
+				}
+			}
+		}
+	}()
+}
+
 func isDevKEK(cfg *config.Config) bool {
 	return cfg == nil || cfg.StoreDriver == "" || cfg.StoreDriver == "memory"
 }

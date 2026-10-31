@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"ziniao/app"
+	"ziniao/network"
 	"ziniao/platform/config"
 )
 
@@ -27,6 +29,12 @@ func main() {
 	noDispatch := flag.Bool("no-dispatch", false, "不启动事件派发循环（测试用）")
 	noJobs := flag.Bool("no-jobs", false, "不启动定时巡检任务（测试用）")
 	demoSite := flag.Bool("demo-site", false, "挂载账号隔离实测站点 /demo/*（仅本地验证用，生产严禁开启）")
+	ipBase := flag.String("ip-base-url", "", "住宅代理商 API 基址；为空表示不启用逐环境出口 IP（生产必填）")
+	ipAcquire := flag.String("ip-acquire-path", "/api/v1/proxies/acquire", "代理商申请出口资源接口路径")
+	ipRelease := flag.String("ip-release-path", "/api/v1/proxies/release", "代理商归还出口资源接口路径")
+	ipAuth := flag.String("ip-auth", "bearer", "代理商鉴权方式：bearer|query|basic")
+	ipProto := flag.String("ip-protocol", "socks5", "代理商出口协议：socks5|http|https")
+	ipLease := flag.Duration("ip-lease", 24*time.Hour, "资源未返回到期时间时的兜底租约")
 	flag.Parse()
 
 	cfg := config.Load()
@@ -58,6 +66,7 @@ func main() {
 		log.Error("应用装配失败", "err", err)
 		os.Exit(1)
 	}
+	wireIPPool(ctx, log, a, *ipBase, *ipAcquire, *ipRelease, *ipAuth, *ipProto, *ipLease)
 
 	if !*noDispatch {
 		go a.Bus.Start(ctx)
@@ -88,4 +97,37 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	log.Info("服务已停止")
+}
+
+// wireIPPool 装配住宅代理商出口池（每个环境一个独立出口 IP）。
+//
+// 这是多账号防关联的最后一块拼图：不配池子时所有店铺共用本机公网出口，
+// 平台一眼就能把账号串起来——画像再像、指纹再散都白费。
+//
+// 代理商密钥**只从环境变量读取**（ZINIAO_IP_TOKEN）：口令进 argv 会被任意进程
+// 用 wmic 读到，这一点与上游代理凭据同样处理。
+func wireIPPool(ctx context.Context, log *slog.Logger, a *app.App,
+	base, acquirePath, releasePath, auth, proto string, lease time.Duration) {
+	if strings.TrimSpace(base) == "" {
+		log.Warn("未配置住宅代理商：所有环境共用本机公网出口，多账号存在关联风险",
+			"hint", "-ip-base-url + ZINIAO_IP_TOKEN")
+		return
+	}
+	token := strings.TrimSpace(os.Getenv("ZINIAO_IP_TOKEN"))
+	if token == "" {
+		log.Error("已配置代理商但未设置 ZINIAO_IP_TOKEN，出口 IP 池未启用")
+		return
+	}
+	p := network.NewHTTPProvider(network.VendorConfig{
+		Name: "ip-vendor", BaseURL: base, Token: token,
+		AuthStyle: auth, AcquirePath: acquirePath, ReleasePath: releasePath,
+		Protocol: network.Protocol(proto), Timeout: 15 * time.Second,
+	})
+	if err := p.Health(ctx); err != nil {
+		log.Error("代理商健康检查失败，出口 IP 池未启用", "err", err.Error())
+		return
+	}
+	a.SetIPPool(network.NewAllocator(p, lease))
+	a.StartIPReaper(ctx, 10*time.Minute)
+	log.Info("住宅代理商出口池已就绪（逐环境独立出口）", "protocol", proto, "lease", lease.String())
 }

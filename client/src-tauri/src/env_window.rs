@@ -37,8 +37,32 @@ struct LaunchSpec {
     script_bytes: usize,
     #[serde(default)]
     open_url: String,
+    /// 本环境**专属**的出口代理凭据（服务端逐环境分配）。
+    /// 为空表示服务端未启用出口 IP 池，此时回退进程级 ZINIAO_UPSTREAM_* 环境变量。
+    #[serde(default)]
+    upstream: Option<UpstreamCredential>,
     #[serde(default)]
     snapshot: Option<HashMap<String, String>>,
+}
+
+/// UpstreamCredential 与服务端 shop.UpstreamCredential 对齐。
+/// 口令只在内存与本进程子进程的环境变量里流转，不落盘、不进 argv。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamCredential {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: i32,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    city: Option<String>,
 }
 
 /// LaunchEnvInput 前端传入：服务端地址、令牌、店铺、可选的打开 URL。
@@ -172,11 +196,22 @@ async fn ensure_proxy(app: &tauri::AppHandle, spec: &LaunchSpec) -> bool {
     }
     let exe = candidate_proxy_paths(app);
     let Some(path) = exe else { return false };
-    // 上游代理凭据只经环境变量注入（不进 argv——Windows 下任意进程可读命令行；
-    // 不落盘——由部署方/操作者以 ZINIAO_UPSTREAM_* 设置，随进程生命周期消失）
-    let upstream_envs: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("ZINIAO_UPSTREAM_"))
-        .collect();
+    // 出口 IP 凭据来源：**优先用启动单里本环境专属的那一份**。
+    // 这是多账号防关联的命脉——同一客户端上所有窗口若共用一组进程级环境变量，
+    // 就等于所有店铺从同一个出口 IP 出网，平台据此可直接把账号关联起来。
+    let upstream_envs: Vec<(String, String)> = match &spec.upstream {
+        Some(u) if !u.host.is_empty() && u.port > 0 => vec![
+            ("ZINIAO_UPSTREAM_HOST".to_string(), u.host.clone()),
+            ("ZINIAO_UPSTREAM_PORT".to_string(), u.port.to_string()),
+            ("ZINIAO_UPSTREAM_USER".to_string(), u.username.clone()),
+            ("ZINIAO_UPSTREAM_PASS".to_string(), u.password.clone()),
+            ("ZINIAO_UPSTREAM_PROTO".to_string(), u.protocol.clone()),
+        ],
+        // 回退：由部署方设置的进程级环境变量（此时所有环境共用一个出口，仅本地自测可接受）
+        _ => std::env::vars()
+            .filter(|(k, _)| k.starts_with("ZINIAO_UPSTREAM_"))
+            .collect(),
+    };
     let _ = std::process::Command::new(path)
         .args([
             "--listen".to_string(),
