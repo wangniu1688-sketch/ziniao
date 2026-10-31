@@ -97,6 +97,9 @@ func (t txStore) SecurityEvents() store.SecurityEventRepo {
 }
 func (t txStore) Vault() store.VaultRepo        { return vaultRepo{base{q: t.q, inTx: true}} }
 func (t txStore) Approvals() store.ApprovalRepo { return approvalRepo{base{q: t.q, inTx: true}} }
+func (t txStore) EgressBindings() store.EgressBindingRepo {
+	return egressRepo{base{q: t.q, inTx: true}}
+}
 
 func (s *Store) Tenants() store.TenantRepo               { return tenantRepo{base{st: s, q: s.pool}} }
 func (s *Store) Users() store.UserRepo                   { return userRepo{base{st: s, q: s.pool}} }
@@ -119,6 +122,7 @@ func (s *Store) Policies() store.AccessPolicyRepo        { return policyRepo{bas
 func (s *Store) SecurityEvents() store.SecurityEventRepo { return secEventRepo{base{st: s, q: s.pool}} }
 func (s *Store) Vault() store.VaultRepo                  { return vaultRepo{base{st: s, q: s.pool}} }
 func (s *Store) Approvals() store.ApprovalRepo           { return approvalRepo{base{st: s, q: s.pool}} }
+func (s *Store) EgressBindings() store.EgressBindingRepo { return egressRepo{base{st: s, q: s.pool}} }
 
 // base 仓库公共能力：事务复用 / 非事务自动包事务。
 type base struct {

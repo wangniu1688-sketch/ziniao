@@ -28,6 +28,11 @@ type VendorConfig struct {
 	RegionsPath string
 	AcquirePath string
 	ReleasePath string
+	// AttachPath 按资源 ID 取回既存出口的接口路径，支持 {id} 占位
+	// （如 /api/v1/proxies/{id}，无占位时自动追加 /{id}）。
+	// 这是「重启后复用同一出口」的唯一可行来源：出口凭据按 L4 不落库，
+	// 只能向厂商要。留空表示厂商不支持，重启后会重新申请并触发轮换告警。
+	AttachPath string
 
 	Protocol Protocol      // 申请时要求的协议，默认 socks5
 	Timeout  time.Duration // 单次 API 调用超时
@@ -108,21 +113,60 @@ func (p *HTTPProvider) Acquire(ctx context.Context, r Region) (*AcquiredProxy, e
 	if err := p.call(ctx, http.MethodPost, p.cfg.AcquirePath, body, &raw); err != nil {
 		return nil, err
 	}
-	nodes := collectObjects(raw)
+	if res := p.pick(collectObjects(raw), "", r); res != nil {
+		return res, nil
+	}
+	return nil, fmt.Errorf("network: 代理商 %s 返回中未找到可用出口资源", p.Name())
+}
+
+// Attach 按资源 ID 取回既存出口的凭据（重启后复用同一出口的唯一途径）。
+//
+// 厂商的「查询单条代理」接口形态差异很大：有的 GET /proxies/{id}，有的
+// GET /proxies?id=xxx。这里只认路径占位（{id}），其余靠 AttachPath 配置兜住——
+// 与其猜参数名，不如让使用者按自己的厂商填一条路径。
+func (p *HTTPProvider) Attach(ctx context.Context, id string) (*AcquiredProxy, error) {
+	if id == "" {
+		return nil, fmt.Errorf("network: 取回出口凭据必须带资源 ID")
+	}
+	if strings.TrimSpace(p.cfg.AttachPath) == "" {
+		return nil, fmt.Errorf("network: 代理商 %s 未配置 attach 接口（-ip-attach-path）", p.Name())
+	}
+	path := p.cfg.AttachPath
+	if strings.Contains(path, "{id}") {
+		path = strings.ReplaceAll(path, "{id}", url.PathEscape(id))
+	} else {
+		path = strings.TrimRight(path, "/") + "/" + url.PathEscape(id)
+	}
+	var raw map[string]any
+	if err := p.call(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	if res := p.pick(collectObjects(raw), id, Region{ASNType: ASNResidential}); res != nil {
+		return res, nil
+	}
+	return nil, fmt.Errorf("network: 代理商 %s 未返回资源 %s 的出口信息", p.Name(), id)
+}
+
+// pick 从厂商响应里的候选对象中挑第一条可用出口。
+// id 非空时强制使用该 ID（Attach 场景必须以库里的 ID 为准，否则资源会脱钩）。
+func (p *HTTPProvider) pick(nodes []map[string]any, id string, r Region) *AcquiredProxy {
 	for _, n := range nodes {
 		host := stringField(n, hostKeys...)
 		port := intField(n, portKeys...)
 		if host == "" || port == 0 {
 			continue
 		}
-		id := stringField(n, "id", "sid", "neek", "order_id", "proxy_id")
-		if id == "" {
-			id = fmt.Sprintf("%s-%d-%d", host, port, time.Now().UnixNano())
+		rid := id
+		if rid == "" {
+			rid = stringField(n, "id", "sid", "neek", "order_id", "proxy_id")
+		}
+		if rid == "" {
+			rid = fmt.Sprintf("%s-%d-%d", host, port, time.Now().UnixNano())
 		}
 		out := &AcquiredProxy{
-			ID: id,
+			ID: rid,
 			Proxy: ProxyConfig{
-				ID:       id,
+				ID:       rid,
 				Protocol: p.cfg.Protocol,
 				Host:     host,
 				Port:     port,
@@ -138,9 +182,9 @@ func (p *HTTPProvider) Acquire(ctx context.Context, r Region) (*AcquiredProxy, e
 		if out.Proxy.ASNType == "" {
 			out.Proxy.ASNType = ASNResidential
 		}
-		return out, nil
+		return out
 	}
-	return nil, fmt.Errorf("network: 代理商 %s 返回中未找到可用出口资源", p.Name())
+	return nil
 }
 
 // Release 归还资源。多数厂商的释放失败通常是「已过期」，不视为致命错误——

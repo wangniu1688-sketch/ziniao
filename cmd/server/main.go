@@ -32,6 +32,7 @@ func main() {
 	ipBase := flag.String("ip-base-url", "", "住宅代理商 API 基址；为空表示不启用逐环境出口 IP（生产必填）")
 	ipAcquire := flag.String("ip-acquire-path", "/api/v1/proxies/acquire", "代理商申请出口资源接口路径")
 	ipRelease := flag.String("ip-release-path", "/api/v1/proxies/release", "代理商归还出口资源接口路径")
+	ipAttach := flag.String("ip-attach-path", "", "代理商按 ID 取回出口的接口路径（支持 {id} 占位）；不配则重启后无法复用既有出口")
 	ipAuth := flag.String("ip-auth", "bearer", "代理商鉴权方式：bearer|query|basic")
 	ipProto := flag.String("ip-protocol", "socks5", "代理商出口协议：socks5|http|https")
 	ipLease := flag.Duration("ip-lease", 24*time.Hour, "资源未返回到期时间时的兜底租约")
@@ -66,7 +67,7 @@ func main() {
 		log.Error("应用装配失败", "err", err)
 		os.Exit(1)
 	}
-	wireIPPool(ctx, log, a, *ipBase, *ipAcquire, *ipRelease, *ipAuth, *ipProto, *ipLease)
+	wireIPPool(ctx, log, a, *ipBase, *ipAcquire, *ipRelease, *ipAttach, *ipAuth, *ipProto, *ipLease)
 
 	if !*noDispatch {
 		go a.Bus.Start(ctx)
@@ -106,8 +107,12 @@ func main() {
 //
 // 代理商密钥**只从环境变量读取**（ZINIAO_IP_TOKEN）：口令进 argv 会被任意进程
 // 用 wmic 读到，这一点与上游代理凭据同样处理。
+//
+// 出口绑定会写入 egress_bindings（重启/发布不换 IP）。AttachPath 决定重启后能否
+// 「取回」同一出口：凭据不落库（L4），厂商不支持取回时只能重新申请，
+// 那时会走轮换告警——让运营看见，而不是静默换 IP。
 func wireIPPool(ctx context.Context, log *slog.Logger, a *app.App,
-	base, acquirePath, releasePath, auth, proto string, lease time.Duration) {
+	base, acquirePath, releasePath, attachPath, auth, proto string, lease time.Duration) {
 	if strings.TrimSpace(base) == "" {
 		log.Warn("未配置住宅代理商：所有环境共用本机公网出口，多账号存在关联风险",
 			"hint", "-ip-base-url + ZINIAO_IP_TOKEN")
@@ -121,13 +126,23 @@ func wireIPPool(ctx context.Context, log *slog.Logger, a *app.App,
 	p := network.NewHTTPProvider(network.VendorConfig{
 		Name: "ip-vendor", BaseURL: base, Token: token,
 		AuthStyle: auth, AcquirePath: acquirePath, ReleasePath: releasePath,
-		Protocol: network.Protocol(proto), Timeout: 15 * time.Second,
+		AttachPath: attachPath,
+		Protocol:   network.Protocol(proto), Timeout: 15 * time.Second,
 	})
 	if err := p.Health(ctx); err != nil {
 		log.Error("代理商健康检查失败，出口 IP 池未启用", "err", err.Error())
 		return
 	}
-	a.SetIPPool(network.NewAllocator(p, lease))
+	alloc := network.NewAllocator(p, lease)
+	alloc.SetLogger(log)
+	// 绑定落库：没有它，每次重启都会给全部店铺换一次出口 IP。
+	alloc.SetBindingStore(a.Store.EgressBindings())
+	a.SetIPPool(alloc)
 	a.StartIPReaper(ctx, 10*time.Minute)
-	log.Info("住宅代理商出口池已就绪（逐环境独立出口）", "protocol", proto, "lease", lease.String())
+	if strings.TrimSpace(attachPath) == "" {
+		log.Warn("未配置 -ip-attach-path：重启后无法向代理商取回既有出口，" +
+			"环境会被重新分配（每次发布都会触发一次出口轮换告警）")
+	}
+	log.Info("住宅代理商出口池已就绪（逐环境独立出口，绑定已落库）",
+		"protocol", proto, "lease", lease.String(), "attach", attachPath != "")
 }

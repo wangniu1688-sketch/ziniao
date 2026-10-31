@@ -213,7 +213,9 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 	var prevAddr string
 	if s.pool != nil {
 		country := env.Snapshot["country"]
-		res, allocErr := s.pool.AllocateEx(ctx, env.ID, network.Region{
+		// 必须带租户上下文：出口绑定要按租户落库（缺租户时分配器直接拒绝，
+		// 不会降级成内存绑定——那等于重启即换 IP）。
+		res, allocErr := s.pool.AllocateEx(tctx, env.ID, network.Region{
 			Country: country, ASNType: network.ASNResidential,
 		})
 		if allocErr != nil {
@@ -226,7 +228,9 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 			Host:     p.Host,
 			Port:     p.Port,
 			Username: p.Username,
-			Password: p.Password, // 口令只随本次启动单下发，不进审计、不落库
+			// 口令只随本次启动单下发，不进审计、不落库（egress_bindings 里只有
+			// 资源标识；重启后由分配器向代理商按 ID 取回凭据）。
+			Password: p.Password,
 			Country:  p.Country,
 			City:     p.City,
 		}

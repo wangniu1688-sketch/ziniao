@@ -170,9 +170,9 @@
   安全事件，detail 带 prev_exit/current_exit。实测：12s 租约到期后再 launch，
   出口 39101→39102 且事件正确落库。同一账号换个 IP 登录是平台眼里的强风险信号，
   必须让运营看见而不是静默发生。
-- **买真代理前的硬前置**：绑定关系目前在**分配器内存**里，服务重启后环境会拿到
-  新出口 IP（有告警，但没解决"不换"）。上真账号前必须落库持久化
-  （建议 shop_lookup 表 + memory/PG 双实现），否则每次发布/deploy 都会让店铺换 IP。
+- **买真代理前的硬前置 ✅（已解决）**：绑定关系原先只在**分配器内存**里，服务重启后
+  环境会拿到新出口 IP（有告警，但没解决"不换"）。现已落库到 `egress_bindings`，
+  重启/发布后走同一条绑定取回同一出口——细节见第 11 条。
 - **仍缺**：厂商的**质量元数据**（ASN 真实类型、rDNS/TTL 一致性、黑名单历史）
   目前按 residential 假设，纯净度打分缺真实输入；`ProxyConfig` 也未长期落库沉淀，
   无法做「历史共用同一 ASN」的关联检测（见第 9 条）。
@@ -206,3 +206,42 @@
   决定是否连带撤销，属间接证据。根治需给 `user_roles` 增加 `source` 列
   （`permanent`/`temporary`），届时改为显式字段判断。测试
   `TestRevokeKeepsEarlierPermanentRole` 锁住了这条判据。
+
+## 11. ~~出口绑定持久化~~ → ✅ 已落库（`egress_bindings`，migration 0005）
+
+- **问题**：绑定关系原先只活在 `network.Allocator` 的四张 map 里，进程重启即空 ⇒
+  每个环境被重新分配一个新出口。对平台而言「同一账号忽然换登录 IP」是最强的关联信号之一，
+  等于**每次 deploy 都主动给全部店铺做一次 IP 跳变**。docs 此前把它标为「上真账号前必须落库」。
+- **落库什么**：`env_id / tenant_id / provider / resource_id / protocol / host / port /
+  country / region / city / asn / asn_type / region_code / last_exit / bound_at / expires_at`。
+  **不落凭据**（L4）：username/password 只随启动单下发；重启后由分配器调
+  `Provider.(Attacher).Attach(resource_id)` 向代理商**取回**，`-ip-attach-path` 配置路径
+  （支持 `{id}` 占位）。厂商不支持取回时只能重新申请，此时出口必变 ⇒ 仍会触发
+  `env.exit_ip_rotated`（high），并在启动日志与运行日志里说明原因，绝不静默换。
+- **两条互斥锁都在数据库里**（进程内 map 只对一个进程有效，滚动发布时新旧进程会同时申请）：
+  ① `(provider, resource_id)` ② `(provider, host, port)`。后者容易被漏掉——平台看到的是
+  **出口地址**，不是我们的订单号；同一 IP:PORT 被重复下发了两个订单号时，只看资源 ID 会放过
+  「两店同 IP」。PG 侧用不带推断目标的 `ON CONFLICT DO NOTHING`，撞任一条唯一索引都算
+  「资源已被占用」，交给分配器换下一个候选，而不是把 23505 冒成 500。
+- **fail-closed**：绑定写不进库就**拒绝下发出口**（`ErrBindingUnavailable`），并把刚申请到的
+  资源归还厂商。发一个「重启后必然换 IP」的出口比这次起不来贵得多。
+  缺租户上下文同样拒绝——不降级成内存绑定。
+- **回收**：`network.egress_sweep`（15m）按租户删到期绑定并**向厂商归还资源**。
+  重启后内存是空的，只有库知道这台机器还占着哪些资源；不归还等于持续计费 + 占着代理商名额
+  （新环境申请不到独占 IP，表现为莫名的 `ErrNoExclusiveResource`）。
+  与 `network` 池内的 10m 内存巡检分工：后者管进程内过期，前者管库里跨重启的残留。
+- **轮换判定跨重启**：`last_exit` 随绑定一起落库，重启后拿它当对照值；
+  没有这一列，重启导致的 IP 跳变在告警里会变成「首次分配」，运营看不到。
+- **实测**：
+  - 单测（`network/egress_test.go`）：重启复用同出口且不重复向厂商申请、厂商不支持 Attach 时
+    正确报轮换并归还旧资源、落库失败 fail-closed、跨实例抢同一出口被数据库挡住、
+    到期 sweep 归还资源、过期绑定被替换并带出旧出口。
+  - PG 16.15 实跑（`platform/store/pg/egress_test.go`，`ZINIAO_PG_DSN` 存在时执行）：
+    迁移 0005 应用成功；两条唯一索引各自的冲突都返回「占用」且不落库；
+    `DELETE ... RETURNING` 只删到期行；同一环境换绑只剩一行；Release 幂等。
+    另有 `TestAllocatorRestartOnPG` 用真库 + 真分配器验证「重启后取回同一条绑定、申请次数仍为 1」。
+    实跑数据按租户前缀清理。
+- **仍缺**：多代理商路由（`egress_bindings.provider` 已留字段，选择策略未实现）；
+  绑定历史留档（当前只有「当前绑定」，做「历史共用同一 ASN」关联检测需要事件化）；
+  环境停用/删除尚无服务端入口，因此 `Allocator.Release`（解绑 + 归还）目前只有
+  「到期 sweep」这一条实际触发路径——建了入口后应在那里调用它，别等租约到期。

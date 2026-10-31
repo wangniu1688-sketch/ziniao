@@ -354,7 +354,7 @@ POST /api/v1/shops/batch/import              → 逐行走权限 + 配额 + 审�
 | 内核一致性 | 窗口 UA 与注入画像同源，标题栏显示 内核版本/地区/代理状态 |
 | 出口通道 | 每 environment 拉起一个独立 `ziniao-proxy` 进程：HTTP CONNECT → **MITM**（本地 CA 动态签发目标证书）+ 对目标 **uTLS 重建 ClientHello**；找不到该进程如实显示"直连"而不伪造 TLS |
 | HTTP/2 | ⚠️ 现阶段**只对目标协商 HTTP/1.1**：h2 头部是 HPACK 二进制帧，无法字节改写且会导致链路不可用。留 `TLSProxyConfig.HTTP2` 开关，真正的 h2 支持需 HPACK 层改写或 fork Chromium |
-| **出口 IP 隔离** ✅ | 服务端资源池按环境分配**独立**住宅出口，凭据随**启动单**逐环境下发（`-ip-base-url` + `ZINIAO_IP_TOKEN`）。实测两个窗口流量零交叉；分配失败直接拒绝启动，不退回直连 |
+| **出口 IP 隔离** ✅ | 服务端资源池按环境分配**独立**住宅出口，凭据随**启动单**逐环境下发（`-ip-base-url` + `ZINIAO_IP_TOKEN`）。绑定落库 `egress_bindings`：重启/发布走同一出口（凭据按 `resource_id` 向代理商取回，落库失败即拒绝下发）。实测两个窗口流量零交叉；分配失败直接拒绝启动，不退回直连 |
 
 ### 接入住宅代理商（多账号防关联的命脉）
 
@@ -363,11 +363,19 @@ set ZINIAO_IP_TOKEN=你的代理商密钥          :: 不进 argv，wmic 读不�
 ziniao-server.exe -ip-base-url https://api.你的代理商.com ^
                   -ip-acquire-path /api/v1/proxies/acquire ^
                   -ip-release-path /api/v1/proxies/release ^
+                  -ip-attach-path /api/v1/proxies/{id} ^
                   -ip-auth bearer -ip-protocol socks5
 ```
 
 厂商差异（接口路径 / 鉴权 / 字段名 host|ip|ip_address、port|http_port|socks_port…）
 由 `network.VendorConfig` + 宽松解析兜住，换厂商改参数即可。
+
+**绑定落库（重启不换 IP）**：环境 ↔ 出口的绑定写入 `egress_bindings`
+（migration 0005），进程重启/发布后按 `resource_id` 走 `-ip-attach-path` 向代理商
+**取回**同一出口的凭据（凭据本身按 L4 不落库）。厂商不支持取回时不配该参数也能跑，
+但重启会重新申请 ⇒ 出口变更并触发 `env.exit_ip_rotated` 告警（启动日志会提前告知）。
+互斥由两条唯一索引保证：`(provider,resource_id)` 与 `(provider,host,port)`；
+落库失败直接拒绝启动（**不发一个重启后必然换 IP 的出口**）。
 **不购买也行**：不配 `-ip-base-url` 时环境仍可启动，但所有店铺共用本机公网出口，
 不具备多账号隔离能力——服务启动日志会对此告警。
 | 版本自洽 | 环境声称的 Chrome 版本、TLS 基线、`navigator.userAgent`、**请求头 sec-ch-ua** 四者同源：uTLS 缺位的版本会把 UA 一并回落（`shop.CreateEnv`），请求头由 sidecar 在明文处改写（`network/header_rewrite.go`，身份来自 `ZINIAO_ENV_UA`） |

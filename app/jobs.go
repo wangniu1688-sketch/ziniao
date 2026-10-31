@@ -82,7 +82,19 @@ func (g grantReaper) RevokeExpired(ctx context.Context, tenantID string, now tim
 	return g.a.Tenant.RevokeExpiredGrants(ctx, tenantID, now)
 }
 
-// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收）。
+type egressSweeper struct{ a *App }
+
+// SweepTenant 清理该租户到期的出口绑定，并向代理商归还资源。
+// 池子未装配时直接返回 0：没配代理商就没有绑定可清。
+func (s egressSweeper) SweepTenant(ctx context.Context, tenantID string, now time.Time) (int, error) {
+	pool := s.a.Environments.IPPool()
+	if pool == nil {
+		return 0, nil
+	}
+	return pool.SweepTenant(ctx, tenantID, now)
+}
+
+// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收 / 出口绑定回收）。
 func (a *App) wireJobs() {
 	cfg := a.Config
 	sched := jobs.NewScheduler(tenantLister{st: a.Store}, a.Log)
@@ -92,6 +104,7 @@ func (a *App) wireJobs() {
 		jobs.NewShopPurger(trashPurger{a: a}, cfg.Limits.ShopTrashRetentionDays),
 		jobs.NewApprovalJanitor(approvalSweeper{a: a}),
 		jobs.NewTempGrantJanitor(grantReaper{a: a}),
+		jobs.NewEgressJanitor(egressSweeper{a: a}),
 	)
 	a.Jobs = sched
 }

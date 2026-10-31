@@ -70,6 +70,19 @@ func (p *MockProvider) Acquire(_ context.Context, r Region) (*AcquiredProxy, err
 	return out, nil
 }
 
+// Attach 按 ID 取回尚未释放的资源，模拟「重启后向代理商取回凭据」。
+// 有它，内存模式/本地演示也能验证「重启不换出口」这条路径。
+func (p *MockProvider) Attach(_ context.Context, id string) (*AcquiredProxy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	res, ok := p.issued[id]
+	if !ok {
+		return nil, fmt.Errorf("network: 资源不存在: %s", id)
+	}
+	cp := *res
+	return &cp, nil
+}
+
 func (p *MockProvider) Release(_ context.Context, id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

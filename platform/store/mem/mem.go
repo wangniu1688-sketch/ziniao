@@ -48,6 +48,9 @@ type Store struct {
 
 	// Phase 2：审批工单
 	approvals map[string]*types.ApprovalTicket
+
+	// Phase 2B：出口绑定（env_id -> 绑定）
+	egress map[string]*types.EgressBinding
 }
 
 // New 创建空存储。
@@ -62,6 +65,7 @@ func New() *Store {
 		devices: map[string]*types.Device{}, envs: map[string]*types.Environment{},
 		envByShop: map[string]string{}, policies: map[string]*types.AccessPolicy{},
 		vault: map[string]*types.ShopCredential{}, approvals: map[string]*types.ApprovalTicket{},
+		egress: map[string]*types.EgressBinding{},
 	}
 }
 
@@ -97,6 +101,7 @@ func (s *Store) Policies() store.AccessPolicyRepo        { return policyRepo{s} 
 func (s *Store) SecurityEvents() store.SecurityEventRepo { return secEventRepo{s} }
 func (s *Store) Vault() store.VaultRepo                  { return vaultRepo{s} }
 func (s *Store) Approvals() store.ApprovalRepo           { return approvalRepo{s} }
+func (s *Store) EgressBindings() store.EgressBindingRepo { return egressRepo{s} }
 
 // ---------- 租户 ----------
 

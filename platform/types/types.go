@@ -253,6 +253,38 @@ type Environment struct {
 	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
+// ---------- 出口绑定（网络） ----------
+
+// EgressBinding 环境 ↔ 代理商出口资源的绑定，落库以保证重启/发布后出口不变。
+//
+// 刻意没有 username/password 字段（L4）：出口凭据只随启动单下发，重启后按
+// ResourceID 向代理商取回（network.Attacher）。库里有凭据就意味着多一份泄漏面，
+// 而凭据本身对「绑定关系」这件事毫无信息价值。
+type EgressBinding struct {
+	EnvID      string `json:"env_id"`
+	TenantID   string `json:"tenant_id"`
+	Provider   string `json:"provider"`
+	ResourceID string `json:"resource_id"`
+	Protocol   string `json:"protocol"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	Country    string `json:"country,omitempty"`
+	Region     string `json:"region,omitempty"`
+	City       string `json:"city,omitempty"`
+	ASN        string `json:"asn,omitempty"`
+	ASNType    string `json:"asn_type,omitempty"`
+	RegionCode string `json:"region_code,omitempty"`
+	// LastExit 上次实际使用的出口 host:port。存在的唯一理由：进程重启后
+	// 内存里的「上次出口」没了，而出口变更告警恰恰依赖它——没有它，
+	// 重启导致的 IP 跳变会变成静默发生。
+	LastExit string    `json:"last_exit,omitempty"`
+	BoundAt  time.Time `json:"bound_at"`
+	// ExpiresAt 到期时间：到期后必须归还厂商资源，否则既持续计费，
+	// 又会占着代理商的名额让新环境申请不到。
+	ExpiresAt time.Time `json:"expires_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // ---------- 安全中心（M14） ----------
 
 // PolicyRuleType 访问策略规则类型：页面级 / 元素级 / 高危操作。

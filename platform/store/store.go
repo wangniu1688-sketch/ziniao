@@ -113,6 +113,25 @@ type DataGrantRepo interface {
 	DeleteExpired(ctx context.Context, tenantID string, now time.Time) ([]types.DataGrant, error)
 }
 
+// EgressBindingRepo 环境 ↔ 出口资源的绑定（重启不换 IP 的落点）。
+//
+// 口径与 DataGrantRepo 一致：**仓储只负责给全数据，不替上层做时间判定**。
+// 过期行必须能被读到——分配器靠它知道「这个环境原先绑的是哪条资源」，
+// 才能归还厂商资源、才能判断重启后出口是否被迫变更。
+type EgressBindingRepo interface {
+	// Bind 把环境绑定到一条出口资源；返回 false 表示该资源已被别的环境独占
+	// （并发下的真相源是 (provider,resource_id) 唯一索引，不是进程内 map）。
+	Bind(ctx context.Context, b *types.EgressBinding) (bool, error)
+	// Get 取该环境的绑定；没有绑定时返回 (nil, nil) 而不是 NotFound——
+	// 「首次分配」是正常路径，用错误码表达会让调用方靠错误字符串分支。
+	Get(ctx context.Context, envID string) (*types.EgressBinding, error)
+	ListByTenant(ctx context.Context) ([]types.EgressBinding, error)
+	// Release 解除绑定（幂等）。资源的归还需由调用方对代理商发起。
+	Release(ctx context.Context, envID string) error
+	// DeleteExpired 物理删除到期绑定并返回被删条目：回收任务要据此向厂商归还资源。
+	DeleteExpired(ctx context.Context, tenantID string, now time.Time) ([]types.EgressBinding, error)
+}
+
 type SessionRepo interface {
 	Create(ctx context.Context, s *types.Session) error
 	Get(ctx context.Context, id string) (*types.Session, error)
@@ -282,6 +301,7 @@ type Repositories interface {
 	SecurityEvents() SecurityEventRepo
 	Vault() VaultRepo
 	Approvals() ApprovalRepo
+	EgressBindings() EgressBindingRepo
 }
 
 // Tx 事务句柄：与业务写在同一事务内投递事件。
