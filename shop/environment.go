@@ -14,6 +14,7 @@ import (
 	"ziniao/platform/ids"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
+	"ziniao/security"
 )
 
 // EnvService 店铺浏览器环境服务（M0.3 / M2.2）：
@@ -27,10 +28,15 @@ type EnvService struct {
 	// pool 出口 IP 资源池（可选）。未配置时环境直连本机出口——
 	// **本机单IP 无法做多账号隔离**，生产必须配置。
 	pool *network.Allocator
+	// sec 安全事件服务（可选）。出口 IP 变更要能被运营看见。
+	sec *security.Service
 }
 
 // SetIPPool 接入 IP 资源池（由 -ip-base-url 等参数在启动时装配）。
 func (s *EnvService) SetIPPool(a *network.Allocator) { s.pool = a }
+
+// SetSecurity 接入安全事件服务（用于上报出口 IP 变更等账号风险）。
+func (s *EnvService) SetSecurity(svc *security.Service) { s.sec = svc }
 
 // IPPool 当前出口 IP 池（可能为 nil，用于 healthz 展示编排状态）。
 func (s *EnvService) IPPool() *network.Allocator { return s.pool }
@@ -170,6 +176,11 @@ type UpstreamCredential struct {
 	City     string `json:"city,omitempty"`
 }
 
+// Addr 返回 host:port（仅用于告警文案；注意不含口令）。
+func (c UpstreamCredential) Addr() string {
+	return c.Host + ":" + strconv.Itoa(c.Port)
+}
+
 // Launch 下发环境启动单（真实浏览器窗口的能力源）。
 //
 // 裁决仍在服务端（L3）：无 env:launch 权限直接拒绝；启动写审计但不含凭证。
@@ -198,22 +209,26 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 	// 直连意味着所有店铺共用本机这一个公网 IP，比共用代理商 IP 还糟；
 	// 宁可让这个环境起不来，也不能把账号暴露在关联风险里。
 	var upstream *UpstreamCredential
+	var rotated bool
+	var prevAddr string
 	if s.pool != nil {
 		country := env.Snapshot["country"]
-		res, allocErr := s.pool.Allocate(ctx, env.ID, network.Region{
+		res, allocErr := s.pool.AllocateEx(ctx, env.ID, network.Region{
 			Country: country, ASNType: network.ASNResidential,
 		})
 		if allocErr != nil {
 			return nil, apierr.Internal("出口 IP 分配失败: " + allocErr.Error())
 		}
+		rotated, prevAddr = res.Rotated, res.PrevAddr
+		p := res.Proxy
 		upstream = &UpstreamCredential{
-			Protocol: string(res.Protocol),
-			Host:     res.Host,
-			Port:     res.Port,
-			Username: res.Username,
-			Password: res.Password, // 口令只随本次启动单下发，不进审计、不落库
-			Country:  res.Country,
-			City:     res.City,
+			Protocol: string(p.Protocol),
+			Host:     p.Host,
+			Port:     p.Port,
+			Username: p.Username,
+			Password: p.Password, // 口令只随本次启动单下发，不进审计、不落库
+			Country:  p.Country,
+			City:     p.City,
 		}
 	}
 	spec := &LaunchSpec{
@@ -252,6 +267,27 @@ func (s *EnvService) Launch(ctx context.Context, in LaunchInput) (*LaunchSpec, e
 		})
 	}); err != nil {
 		return nil, err
+	}
+	// 出口 IP 变了：必须让运营看见。同一个店铺账号从新 IP 登录，
+	// 在平台眼里是典型的账号风险信号；静默更换等于把运营蒙在鼓里。
+	// 注意：告警失败不应阻断启动（环境本身是可用的），只写事件不抛错。
+	if rotated && s.sec != nil {
+		_ = s.sec.Raise(ctx, security.RaiseInput{
+			TenantID: in.Actor.TenantID,
+			Category: "risk",
+			Level:    "high",
+			ShopID:   in.ShopID,
+			Action:   "env.exit_ip_rotated",
+			Actor:    &in.Actor,
+			Detail: map[string]any{
+				"env_id":       env.ID,
+				"prev_exit":    prevAddr,
+				"current_exit": upstream.Addr(),
+				"country":      upstream.Country,
+				"reason":       "资源到期或代理商重新指派",
+			},
+			Terminal: in.Terminal,
+		})
 	}
 	return spec, nil
 }

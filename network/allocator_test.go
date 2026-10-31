@@ -153,6 +153,48 @@ func TestAllocatorReapsExpired(t *testing.T) {
 	_ = res
 }
 
+// TestAllocatorDetectsExitRotation 出口变更必须被识别出来：
+// 粘住同一出口时不能告警（那是正常行为），换了出口必须能对比出旧值。
+func TestAllocatorDetectsExitRotation(t *testing.T) {
+	p := &stubbornProvider{uniq: true, hosts: []string{"h1", "h2", "h3"}}
+	a := NewAllocator(p, time.Hour)
+	ctx := context.Background()
+
+	first, err := a.AllocateEx(ctx, "env-1", Region{Country: "US"})
+	if err != nil {
+		t.Fatalf("首次分配失败: %v", err)
+	}
+	if first.Rotated || first.PrevAddr != "" {
+		t.Fatalf("首次分配不该标记轮换: %+v", first)
+	}
+	// 重复启动：应粘住同一出口，不算轮换
+	again, err := a.AllocateEx(ctx, "env-1", Region{Country: "US"})
+	if err != nil {
+		t.Fatalf("重复分配失败: %v", err)
+	}
+	if again.Rotated {
+		t.Fatalf("粘住同一出口不该告警: prev=%s cur=%s", again.PrevAddr, again.Proxy.Addr())
+	}
+
+	// 资源过期被回收后重启环境：出口必变，必须能对比出旧出口
+	a.mu.Lock()
+	for _, r := range a.resources {
+		r.ExpiresAt = time.Now().Add(-time.Minute)
+	}
+	a.mu.Unlock()
+	a.Reap(ctx)
+	rotatedRes, err := a.AllocateEx(ctx, "env-1", Region{Country: "US"})
+	if err != nil {
+		t.Fatalf("回收后重新分配失败: %v", err)
+	}
+	if !rotatedRes.Rotated {
+		t.Fatal("出口已更换却未标记轮换，运营会毫不知情")
+	}
+	if rotatedRes.PrevAddr == rotatedRes.Proxy.Addr() {
+		t.Fatalf("prev 与 current 不应相同: %s", rotatedRes.PrevAddr)
+	}
+}
+
 func TestAllocatorRequiresEnvID(t *testing.T) {
 	a := NewAllocator(&stubbornProvider{uniq: true, hosts: []string{"h1"}}, time.Hour)
 	if _, err := a.Allocate(context.Background(), "", Region{Country: "US"}); err == nil {

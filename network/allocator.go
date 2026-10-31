@@ -27,6 +27,17 @@ type Allocator struct {
 	byEnv     map[string]string         // envID -> resourceID（保证粘性）
 	owner     map[string]string         // resourceID -> envID（互斥校验的真相源）
 	tries     int                       // 单次分配最多向厂商申请几次
+	// prevAddr envID -> 上次实际用过的出口。用于识别「这个环境的出口 IP 变了」。
+	// 出口变更本身是极强的关联信号（同一账号一天内从不同国家/IP 登录），
+	// 哪怕我们做了 correct 的隔离也必须让运营看见它，而不是静默发生。
+	prevAddr map[string]string
+}
+
+// AllocResult 分配结果与出口连续性信息。
+type AllocResult struct {
+	Proxy    *ProxyConfig
+	Rotated  bool   // 本次出口与上次不同（非首次分配才有意义）
+	PrevAddr string // 上次出口，空串表示首次分配
 }
 
 // NewAllocator 构造分配器。lease<=0 时用 24h 兜底。
@@ -40,8 +51,28 @@ func NewAllocator(p Provider, lease time.Duration) *Allocator {
 		resources: map[string]*AcquiredProxy{},
 		byEnv:     map[string]string{},
 		owner:     map[string]string{},
+		prevAddr:  map[string]string{},
 		tries:     5,
 	}
+}
+
+// AllocateEx 分配并返回出口连续性信息。
+//
+// 为什么要区分 Rotated：资源过期被回收、厂商重新指派都会让环境换出口，
+// 而对同一账号来说「出口 IP 变了」是平台眼里很强的风险信号，
+// 必须让运营看到，而不是悄悄发生。
+func (a *Allocator) AllocateEx(ctx context.Context, envID string, r Region) (*AllocResult, error) {
+	res, err := a.Allocate(ctx, envID, r)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	addr := res.Addr()
+	prev := a.prevAddr[envID]
+	rotated := prev != "" && prev != addr
+	a.prevAddr[envID] = addr
+	a.mu.Unlock()
+	return &AllocResult{Proxy: res, Rotated: rotated, PrevAddr: prev}, nil
 }
 
 // Provider 当前使用的代理商（排障/展示用）。
@@ -107,6 +138,10 @@ func (a *Allocator) Release(ctx context.Context, envID string) error {
 	if !ok {
 		return nil
 	}
+	// 释放即视为该环境生命周期结束，出口历史不再延续
+	a.mu.Lock()
+	delete(a.prevAddr, envID)
+	a.mu.Unlock()
 	return a.provider.Release(ctx, id)
 }
 

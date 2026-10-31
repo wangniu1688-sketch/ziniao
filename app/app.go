@@ -162,6 +162,7 @@ func (a *App) wirePhase1() {
 	a.Device = device.NewService(st, bus, cfg, engine, a.Entitlement, a.Meter,
 		network.NewMockProvider("US", network.ASNResidential, "New York"))
 	a.Environments = shop.NewEnvService(st, bus, engine, a.Fingerprints, baselines)
+	a.Environments.SetSecurity(a.Security) // 出口 IP 变更等账号风险要能被运营看见
 	a.Vault = shop.NewVault(st, bus, engine, cipher)
 }
 
