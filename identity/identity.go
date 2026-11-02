@@ -78,12 +78,14 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginResult, error
 		_ = s.emitLogin(ctx, "", user.ID, in.Username, "failure", "bad_password", in.Terminal, nil)
 		return nil, apierr.Unauthorized("账号或口令错误")
 	}
-	// 二次验证
-	if user.MFAEnabled && user.TOTPSecret != "" {
-		if !crypto.VerifyTOTP(user.TOTPSecret, in.TOTPCode, time.Now(), 1) {
+	// 二次验证：启用 MFA 却没有可用种子时必须失败关闭，不能静默降级为密码登录。
+	mfaVerified := false
+	if user.MFAEnabled {
+		if user.TOTPSecret == "" || !crypto.VerifyTOTP(user.TOTPSecret, in.TOTPCode, time.Now(), 1) {
 			_ = s.emitLogin(ctx, "", user.ID, in.Username, "blocked", "mfa_failed", in.Terminal, nil)
-			return nil, apierr.New(apierr.CodeMFARequired, 401, "二次验证码错误")
+			return nil, apierr.New(apierr.CodeMFARequired, 401, "二次验证码错误或尚未完成 MFA 配置")
 		}
+		mfaVerified = true
 	}
 
 	// 选择租户
@@ -127,6 +129,7 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginResult, error
 	}
 	token, err := crypto.SignJWT(s.cfg.JWTSecret, map[string]any{
 		"sub": user.ID, "tid": tenantID, "sid": session.ID, "usr": user.Username,
+		"mfa": mfaVerified,
 	}, s.cfg.Limits.AccessTokenTTL)
 	if err != nil {
 		return nil, err
@@ -246,9 +249,12 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*Principal, e
 		roles = append(roles, *role)
 	}
 	grants, _ := s.st.DataGrants().ListByUser(ctx, tenantID, userID, "")
+	// MFA 状态必须来自登录时签名的会话声明，不能仅凭用户启用了 MFA 就
+	// 把所有会话标记为已验证（否则未完成二次验证的旧令牌也能通过 MFA 权限门）。
+	mfaVerified, _ := claims["mfa"].(bool)
 	return &Principal{
 		UserID: userID, TenantID: tenantID, Username: username, SessionID: sessionID,
-		Roles: roles, Grants: grants, IP: sess.IP, MFAVerified: user.MFAEnabled,
+		Roles: roles, Grants: grants, IP: sess.IP, MFAVerified: mfaVerified,
 	}, nil
 }
 
