@@ -222,16 +222,25 @@ func (a *App) wirePhase1() {
 	}
 
 	// 凭证信封加密：本地 KEK（dev 随机）；生产由 SOPS/age 或云 KMS 注入（ADR-0011）
-	kek, err := crypto.NewLocalKEK(nil, 0)
-	if err != nil {
-		a.Log.Error("KEK 初始化失败", "err", err)
+	var kek *crypto.LocalKEK
+	var kekErr error
+	if len(cfg.KEKKeys) > 0 {
+		kek, kekErr = crypto.NewLocalKEK(cfg.KEKKeys, cfg.KEKCurrentVersion)
+	} else if isDevKEK(cfg) {
+		// 仅内存开发环境允许随机 KEK；重启后密文不可解是预期的开发限制。
+		kek, kekErr = crypto.NewLocalKEK(nil, 0)
+	} else {
+		kekErr = fmt.Errorf("持久化 KEK 未配置：请设置 ZINIAO_KEK_KEYS")
 	}
-	if kek != nil && kek.CurrentVersion() > 0 && isDevKEK(cfg) {
-		a.Log.Warn("使用临时随机 KEK（dev only）：重启后历史密文不可解，生产必须注入持久密钥")
+	if kekErr != nil {
+		a.Log.Error("KEK 初始化失败", "err", kekErr)
 	}
-	cipher, err := crypto.NewEnvelope(kek)
-	if err != nil {
-		a.Log.Error("信封加密初始化失败", "err", err)
+	if kek != nil && kek.CurrentVersion() > 0 && isDevKEK(cfg) && len(cfg.KEKKeys) == 0 {
+		a.Log.Warn("使用临时随机 KEK（dev only）：重启后历史密文不可解")
+	}
+	cipher, cipherErr := crypto.NewEnvelope(kek)
+	if cipherErr != nil {
+		a.Log.Error("信封加密初始化失败", "err", cipherErr)
 	}
 	a.Cipher = cipher
 
