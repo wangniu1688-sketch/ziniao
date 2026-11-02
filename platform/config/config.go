@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
@@ -143,6 +144,11 @@ type Config struct {
 	StoreDriver string `key:"store.driver"` // memory|postgres
 	PostgresDSN string `key:"store.postgres_dsn"`
 	JWTSecret   string `key:"auth.jwt_secret"`
+	// KEKKeys 是凭证信封加密的主密钥环，格式由 ZINIAO_KEK_KEYS 注入：
+	// "1:<base64-32-byte-key>,2:<base64-32-byte-key>"。旧版本必须保留用于解密。
+	KEKKeys map[int][]byte
+	KEKCurrentVersion int
+	KEKConfigError string
 
 	// DataDir 数据根目录（M1）。profiles / extensions / runtime / logs / ca 都落在它下面。
 	// 相对路径在装配阶段统一转绝对路径，避免「进程换了工作目录就换了数据目录」。
@@ -270,6 +276,7 @@ func Load() *Config {
 	c.StoreDriver = envStr("ZINIAO_STORE_DRIVER", c.StoreDriver)
 	c.PostgresDSN = envStr("ZINIAO_POSTGRES_DSN", c.PostgresDSN)
 	c.JWTSecret = envStr("ZINIAO_JWT_SECRET", c.JWTSecret)
+	c.KEKKeys, c.KEKCurrentVersion, c.KEKConfigError = parseKEKKeyring(os.Getenv("ZINIAO_KEK_KEYS"), envInt("ZINIAO_KEK_CURRENT_VERSION", 1))
 	c.DemoSite = envBool("ZINIAO_DEMO_SITE", c.DemoSite)
 	// 启动器内核（M1）
 	c.DataDir = envStr("ZINIAO_DATA_DIR", c.DataDir)
@@ -508,6 +515,47 @@ func (c Config) Validate() error {
 		if c.DemoSite {
 			return fmt.Errorf("config: 生产环境禁止启用 demo_site")
 		}
+		if c.KEKConfigError != "" {
+			return fmt.Errorf("config: KEK 配置非法: %s", c.KEKConfigError)
+		}
+		if len(c.KEKKeys) == 0 || c.KEKCurrentVersion <= 0 || len(c.KEKKeys[c.KEKCurrentVersion]) != 32 {
+			return fmt.Errorf("config: 生产环境必须通过 ZINIAO_KEK_KEYS 配置持久化的 32 字节 KEK 密钥环，并设置有效的 ZINIAO_KEK_CURRENT_VERSION")
+		}
 	}
 	return nil
+}
+
+// parseKEKKeyring 解析 "版本:base64密钥,版本:base64密钥" 格式。
+// 接受标准或 Raw Base64；每个版本必须唯一且密钥必须恰好 32 字节。
+func parseKEKKeyring(raw string, current int) (map[int][]byte, int, string) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, current, ""
+	}
+	keys := make(map[int][]byte)
+	for _, entry := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
+		if len(parts) != 2 {
+			return nil, current, "每项必须采用 version:base64 格式"
+		}
+		version, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil || version <= 0 {
+			return nil, current, "密钥版本必须是正整数"
+		}
+		if _, exists := keys[version]; exists {
+			return nil, current, "密钥版本重复"
+		}
+		encoded := strings.TrimSpace(parts[1])
+		key, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			key, err = base64.RawStdEncoding.DecodeString(encoded)
+		}
+		if err != nil || len(key) != 32 {
+			return nil, current, fmt.Sprintf("密钥版本 %d 必须是有效的 32 字节 Base64 密钥", version)
+		}
+		keys[version] = key
+	}
+	if _, ok := keys[current]; !ok {
+		return nil, current, "当前 KEK 版本不在密钥环中"
+	}
+	return keys, current, ""
 }
