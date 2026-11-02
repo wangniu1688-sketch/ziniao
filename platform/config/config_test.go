@@ -64,3 +64,16 @@ func TestParseKEKKeyring(t *testing.T) {
 		t.Fatal("missing current key version should be rejected")
 	}
 }
+
+func TestLoadRejectsMalformedKEKCurrentVersion(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("k", 32)))
+	t.Setenv("ZINIAO_ENV", "prod")
+	t.Setenv("ZINIAO_JWT_SECRET", strings.Repeat("j", 32))
+	t.Setenv("ZINIAO_STORE_DRIVER", "postgres")
+	t.Setenv("ZINIAO_DEMO_SITE", "false")
+	t.Setenv("ZINIAO_KEK_KEYS", "1:"+key)
+	t.Setenv("ZINIAO_KEK_CURRENT_VERSION", "not-a-number")
+	if err := Load().Validate(); err == nil {
+		t.Fatal("malformed current KEK version must fail closed")
+	}
+}
