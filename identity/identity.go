@@ -214,7 +214,7 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*Principal, e
 		return nil, apierr.Unauthorized("无操作超时，请重新登录")
 	}
 
-	user, err := s.st.Users().GetByID(ctx, userID)
+	_, err = s.st.Users().GetByID(ctx, userID)
 	if err != nil {
 		return nil, apierr.Unauthorized("账号不存在")
 	}
