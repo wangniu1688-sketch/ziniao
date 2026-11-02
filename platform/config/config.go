@@ -6,6 +6,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -491,4 +492,22 @@ func ParseCSVEnv(s string) []string {
 		}
 	}
 	return out
+}
+
+
+// Validate 检查进程启动前必须满足的安全配置。
+// 开发环境保留便捷默认值；生产环境对危险默认值采取 fail-closed。
+func (c Config) Validate() error {
+	if strings.EqualFold(strings.TrimSpace(c.Env), "prod") {
+		if c.JWTSecret == "" || c.JWTSecret == "dev-only-secret-change-me" || len([]byte(c.JWTSecret)) < 32 {
+			return fmt.Errorf("config: 生产环境必须设置至少 32 字节的独立 ZINIAO_JWT_SECRET")
+		}
+		if c.StoreDriver != "postgres" {
+			return fmt.Errorf("config: 生产环境必须使用 postgres 存储")
+		}
+		if c.DemoSite {
+			return fmt.Errorf("config: 生产环境禁止启用 demo_site")
+		}
+	}
+	return nil
 }
