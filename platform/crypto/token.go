@@ -45,40 +45,63 @@ func SignJWT(secret string, claims map[string]any, ttl time.Duration) (string, e
 	return signingInput + "." + b64url(mac.Sum(nil)), nil
 }
 
-// ParseJWT 校验签名与过期时间，返回 claims。
+// ParseJWT 严格校验 HS256 签名、JWT 头与必需的过期时间。
+// 不接受缺少 exp、非 HS256 算法或格式错误的签名，避免宽松解析造成算法混淆。
 func ParseJWT(secret, token string) (map[string]any, error) {
+	if secret == "" {
+		return nil, fmt.Errorf("crypto: JWT 密钥为空")
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("crypto: JWT 格式非法")
 	}
+
+	headerRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("crypto: JWT header 非法")
+	}
+	var header map[string]any
+	if err := json.Unmarshal(headerRaw, &header); err != nil {
+		return nil, fmt.Errorf("crypto: JWT header 非法")
+	}
+	if alg, ok := header["alg"].(string); !ok || alg != "HS256" {
+		return nil, fmt.Errorf("crypto: JWT 算法不受支持")
+	}
+	if typ, ok := header["typ"]; ok {
+		if value, valid := typ.(string); !valid || value != "JWT" {
+			return nil, fmt.Errorf("crypto: JWT 类型非法")
+		}
+	}
+
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("crypto: JWT 签名格式非法")
+	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(parts[0] + "." + parts[1]))
-	if !hmac.Equal(mac.Sum(nil), mustB64urlDecode(parts[2])) {
+	if !hmac.Equal(mac.Sum(nil), signature) {
 		return nil, fmt.Errorf("crypto: JWT 签名校验失败")
 	}
+
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, fmt.Errorf("crypto: JWT payload 非法")
 	}
 	claims := map[string]any{}
 	if err := json.Unmarshal(raw, &claims); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("crypto: JWT payload 非法")
 	}
-	if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("crypto: JWT 缺少有效的 exp 声明")
+	}
+	if time.Now().Unix() >= int64(exp) {
 		return nil, fmt.Errorf("crypto: JWT 已过期")
 	}
 	return claims, nil
 }
 
 func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-
-func mustB64urlDecode(s string) []byte {
-	b, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil
-	}
-	return b
-}
 
 // ---------- TOTP (RFC 6238) ----------
 
