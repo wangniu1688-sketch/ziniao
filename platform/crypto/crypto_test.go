@@ -1,11 +1,11 @@
 package crypto_test
 
 import (
-	"strings"
-	"testing"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"strings"
+	"testing"
 	"time"
 
 	"ziniao/platform/crypto"
