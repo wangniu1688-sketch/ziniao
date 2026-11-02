@@ -59,6 +59,7 @@ func TestHighAlertDeliveryEndToEnd(t *testing.T) {
 	t.Setenv("ZINIAO_NOTIFY_MAX_ATTEMPTS", "3")
 
 	cfg := config.Load()
+	cfg.DataDir = t.TempDir() // 避免测试在包目录下建 ./data 并互相抢实例锁
 	st := mem.New()
 	a, err := app.New(ctx, cfg, st, slog.Default())
 	if err != nil {

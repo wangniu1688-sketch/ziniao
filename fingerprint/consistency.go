@@ -32,6 +32,9 @@ type Report struct {
 	Threshold  int      `json:"threshold"`
 	Issues     []Issue  `json:"issues"`
 	Unverified []string `json:"unverified,omitempty"` // 因缺少外部观测值而无法判定的规则
+	// Notes 体检之外要说清楚的事（例如「UA 为什么是 120 而不是本机 156」）。
+	// 落库后随自检报告一起展示：这类问题不能只存在于服务日志里。
+	Notes []string `json:"notes,omitempty"`
 }
 
 // CheckContext 校验上下文：运行时真实观测值（IP 归属地、TLS 指纹、内核版本）。

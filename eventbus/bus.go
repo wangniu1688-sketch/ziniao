@@ -111,9 +111,29 @@ func (b *Bus) DispatchOnce(ctx context.Context) (int, error) {
 			if !matchType(h.Types(), ev.Type) {
 				continue
 			}
+			// 接收侧投递幂等：Handle 成功到 Ack 之间崩溃时整条事件会重投，
+			// 已消费的处理器必须跳过——否则 notify 再生成一整份站内通知、
+			// audit 撞审计主键（entry.ID = event.ID）。查询失败按「未知」处理，
+			// 整条事件等待重试（fail-closed：吞掉 err 当 false 等于没做幂等）。
+			consumed, cerr := b.st.Outbox().Consumed(ectx, env.ID, h.Name())
+			if cerr != nil {
+				handled = false
+				b.log.Error("消费幂等查询失败，事件等待重试", "handler", h.Name(), "id", env.ID, "err", cerr)
+				break
+			}
+			if consumed {
+				continue
+			}
 			if err := h.Handle(ectx, &ev); err != nil {
 				handled = false
 				b.log.Error("事件处理器失败", "handler", h.Name(), "type", ev.Type, "err", err)
+				break
+			}
+			// 逐处理器登记：A 成功 B 失败时，重投只重跑 B，A 的副作用不会来第二遍。
+			// 自登记的处理器（audit/notify 在业务事务内 MarkConsumed）这里重复登记也无害。
+			if err := b.st.Outbox().MarkConsumed(ectx, env.ID, h.Name()); err != nil {
+				handled = false
+				b.log.Error("消费登记失败，事件等待重试", "handler", h.Name(), "id", env.ID, "err", err)
 				break
 			}
 		}

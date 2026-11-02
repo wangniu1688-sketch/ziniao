@@ -53,7 +53,9 @@ func (p *fakeVendor) Acquire(_ context.Context, r Region) (*AcquiredProxy, error
 		ID: id,
 		Proxy: ProxyConfig{
 			ID: id, Protocol: ProtoSOCKS5, Host: host, Port: port,
-			Username: "u", Password: "p", Country: r.Country, ASNType: ASNResidential,
+			Username: "u", Password: "p", Country: r.Country,
+			// ASN 固定：历史留档的验收点就是「同一 ASN 被哪些环境用过」。
+			ASN: "AS13335", ASNType: ASNResidential,
 		},
 		ExpiresAt: time.Now().Add(time.Hour),
 	}

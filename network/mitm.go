@@ -19,6 +19,13 @@ import (
 	"time"
 )
 
+// CACommonName 本地根证书的 CN。
+//
+// 导出它的唯一理由：ca_ready 判定要在**不加载私钥**的前提下问「这张证书装进
+// 用户信任库了没有」（browser 包的启动前置检查），只能按 CN 去信任库里查。
+// 两处各写一份字符串等于埋一颗「改了一边、另一边永远查不到」的雷。
+const CACommonName = "Ziniao Local CA (do not trust outside this machine)"
+
 // MITMCA 本地动态签发证书的 CA。
 //
 // 为什么需要：CONNECT 隧道里客户端（WebView2）自己会跟"目标"做 TLS 握手，
@@ -72,7 +79,7 @@ func LoadOrCreateCA(dir string) (*MITMCA, error) {
 	now := time.Now()
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		Subject:               pkix.Name{CommonName: "Ziniao Local CA (do not trust outside this machine)"},
+		Subject:               pkix.Name{CommonName: CACommonName},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,

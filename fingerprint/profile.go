@@ -100,8 +100,15 @@ type Profile struct {
 	City        string     `json:"city"`
 	Fonts       []string   `json:"fonts"`
 	Plugins     []Plugin   `json:"plugins"`
-	UA          string     `json:"ua"`
-	UACH        UACHInfo   `json:"uach"`
+	UA string `json:"ua"`
+	// ChromeFullVersion UA-CH 里出现的完整版本串（如 120.0.6099.109）。
+	//
+	// 桌面 Chrome 自 M110 起 UA 只出大版本（"Chrome/120.0.0.0"），完整版本只在
+	// sec-ch-ua 的 uaFullVersion / fullVersionList 里出现。两者口径不同，
+	// 混着写就会出现「UA 说 120.0.0.0、uaFullVersion 说 120.0.0.0」这种
+	// 真实浏览器不会有的组合。
+	ChromeFullVersion string   `json:"chrome_full_version,omitempty"`
+	UACH              UACHInfo `json:"uach"`
 	WebRTC      WebRTCInfo `json:"webrtc"`
 	CanvasSeed  string     `json:"canvas_seed"`
 	AudioSeed   string     `json:"audio_seed"`
@@ -194,6 +201,31 @@ func NewLibrary(cfg LibraryConfig, seed int64) *Library {
 		cfg.UsageCap = 50
 	}
 	return &Library{templates: BuiltinProfiles(), usage: map[string]int{}, rng: rand.New(rand.NewSource(seed)), usageCap: cfg.UsageCap}
+}
+
+// LookupTemplate 按 profile_id 反查内置模板。
+//
+// 采样时给模板 ID 追加了随机后缀（`us-mac-mbp-m2-8F3KQ2AB`），所以这里先试全等，
+// 再截掉最后一段后缀试模板 ID。用途：老环境补注入脚本时，用它取回快照里没存下来的
+// UNMASKED GPU 长串、插件集等字段。
+func LookupTemplate(profileID string) (Profile, bool) {
+	if profileID == "" {
+		return Profile{}, false
+	}
+	for _, p := range BuiltinProfiles() {
+		if p.ID == profileID {
+			return p, true
+		}
+	}
+	if i := strings.LastIndex(profileID, "-"); i > 0 {
+		prefix := profileID[:i]
+		for _, p := range BuiltinProfiles() {
+			if p.ID == prefix {
+				return p, true
+			}
+		}
+	}
+	return Profile{}, false
 }
 
 // Add 追加模板（供运营后台录入与采集器入库）。

@@ -1,7 +1,9 @@
 package notify
 
 import (
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"ziniao/platform/config"
 )
@@ -42,6 +44,28 @@ func BuildSenders(cfg *config.Config, log *slog.Logger) ([]Sender, error) {
 			return nil, err
 		}
 		out = append(out, wh)
+	}
+	if cfg.Notify.SMSConfigured() {
+		// 服务商写错必须拦在装配阶段：云市场（AppKey 签名）与 dysmsapi
+		// （AccessKey 的 RPC 签名）是两套完全不同的算法，写成后者会得到一批
+		// 稳定的 403，而不是"看起来发成功了"。
+		if p := strings.ToLower(strings.TrimSpace(cfg.Notify.SMSProvider)); p != "" && p != "aliyun_market" {
+			return nil, fmt.Errorf("notify: 不支持的短信服务商 %q（当前仅 aliyun_market：云市场 AppKey+AppSecret 签名）", cfg.Notify.SMSProvider)
+		}
+		sms, err := NewSMSSender(SMSConfig{
+			AppKey:        cfg.Notify.SMSAppKey,
+			AppSecret:     cfg.Notify.SMSAppSecret,
+			SignName:      cfg.Notify.SMSSignName,
+			TemplateCode:  cfg.Notify.SMSTemplateCode,
+			TemplateKey:   cfg.Notify.SMSTemplateKey,
+			Timeout:       cfg.Notify.SMSTimeout,
+			MaxRetry:      cfg.Notify.SMSMaxRetry,
+			AllowLoopback: cfg.Notify.SMSAllowLoopback,
+		}, log)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sms)
 	}
 	return out, nil
 }

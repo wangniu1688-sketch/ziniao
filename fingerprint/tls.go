@@ -170,6 +170,24 @@ func (l *BaselineLibrary) For(major int) (*TLSBaseline, bool) {
 	return &bl, true
 }
 
+// Majors 基线库里全部内核大版本（升序）。nil 接收者返回空切片。
+//
+// 「内核对齐」要按「本机内核」在上表里往下找最近的可用条目，必须能枚举版本，
+// 否则只能拿画像写死的那个版本去撞（撞不上就静默沿用老版本）。
+func (l *BaselineLibrary) Majors() []int {
+	if l == nil {
+		return nil
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make([]int, 0, len(l.byMajor))
+	for m := range l.byMajor {
+		out = append(out, m)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // ChromeMajorFromUA 从任意 UA 串解析 Chrome 大版本（导出版，供其它包对齐身份用）。
 func ChromeMajorFromUA(ua string) (int, error) {
 	return chromeMajorFromUA(ua)

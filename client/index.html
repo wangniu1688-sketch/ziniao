@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:" />
   <title>紫鸟浏览器</title>
   <style>
     html, body { margin: 0; height: 100%; background: #0b0f1a; color: #e8edf8;
@@ -27,10 +27,37 @@
     .tag { display: inline-block; padding: 1px 9px; border-radius: 20px; font-size: 12px;
       background: rgba(52,211,153,.14); color: #34d399; border: 1px solid rgba(52,211,153,.35); }
     .tag.gray { background: rgba(141,154,184,.14); color: #8d9ab8; border-color: rgba(141,154,184,.35); }
+    .tag.warn { background: rgba(248,113,113,.14); color: #f87171; border-color: rgba(248,113,113,.35); }
+    button.danger { background: transparent; border: 1px solid rgba(248,113,113,.45); color: #f87171; }
     .hint { color: #8d9ab8; font-size: 12px; }
     #status { margin-top: 14px; padding: 10px 14px; border-radius: 10px; background: #131a2a;
       border: 1px solid #26304a; white-space: pre-wrap; font-size: 13px; display: none; }
     #status.err { border-color: #f87171; color: #f87171; }
+
+    /* 通知中心：运营每天待在客户端里开环境，审批待办/委托申请漏了就是漏了——
+       所以它必须在客户端里能看见，而不是只有后台控制台才有。 */
+    .badge { display: none; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 6px;
+      border-radius: 9px; background: #f87171; color: #fff; font-size: 11px; line-height: 18px;
+      text-align: center; vertical-align: middle; }
+    .drawer { position: fixed; top: 0; right: -420px; width: 400px; height: 100%;
+      background: #0e1424; border-left: 1px solid #26304a; box-shadow: -8px 0 24px rgba(0,0,0,.45);
+      transition: right .18s ease; display: flex; flex-direction: column; z-index: 20; }
+    .drawer.show { right: 0; }
+    .drawer header { display: flex; align-items: center; gap: 8px; }
+    .drawer .list { flex: 1; overflow-y: auto; padding: 12px 14px; }
+    .notif { padding: 10px 12px; margin-bottom: 8px; border-radius: 10px; background: #131a2a;
+      border: 1px solid #26304a; }
+    .notif.unread { border-color: #4d7fff; }
+    .notif .t { font-size: 13px; font-weight: 600; }
+    .notif .b { color: #a8b3cc; font-size: 12px; margin-top: 2px; }
+    .notif .m { color: #6b7794; font-size: 11px; margin-top: 6px; display: flex; gap: 10px; align-items: center; }
+    .notif .m .dot { width: 6px; height: 6px; border-radius: 50%; background: #4d7fff; display: inline-block; }
+    .row-between { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .mask { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; z-index: 19; }
+    .mask.show { display: block; }
+    dialog.setting { background: #131a2a; color: #e8edf8; border: 1px solid #26304a;
+      border-radius: 12px; padding: 18px 20px; min-width: 320px; }
+    dialog.setting label { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -41,9 +68,38 @@
     <input id="pass" type="password" placeholder="口令" value="Zn@12345678" style="width:140px" />
     <button id="login">登录</button>
     <span class="spacer"></span>
+    <button id="bell" class="ghost">通知<span id="badge" class="badge">0</span></button>
+    <button id="pref" class="ghost">通知设置</button>
     <button id="reload" class="ghost">刷新环境</button>
+    <input id="country" value="US" title="新建环境的国家（出口属地）" style="width:64px" />
     <span id="who" class="hint"></span>
   </header>
+  <div id="mask" class="mask"></div>
+
+  <aside id="drawer" class="drawer">
+    <header>
+      <span class="brand">通知中心</span>
+      <span class="spacer"></span>
+      <button id="readAll" class="ghost">全部已读</button>
+      <button id="closeDrawer" class="ghost">关闭</button>
+    </header>
+    <div id="notifList" class="list"></div>
+  </aside>
+
+  <dialog id="prefDlg" class="setting">
+    <form method="dialog">
+      <div class="row-between"><b>通知设置</b><span class="hint">站内信始终保留</span></div>
+      <div id="prefBox" style="margin-top:10px"></div>
+      <p class="hint">只控制<b>外发</b>（邮件/短信）。关闭全部外发 = 只在客户端和后台站内信里看得到。</p>
+      <div class="row-between" style="margin-top:14px">
+        <span id="prefMsg" class="hint"></span>
+        <div>
+          <button id="prefSave" type="button">保存</button>
+          <button type="submit" class="ghost">取消</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
 
   <main>
     <p class="hint">每行一个店铺：点「启动环境」会按服务端下发的
@@ -90,9 +146,30 @@
         spec = { token: r.token };
         $('who').textContent = '已登录 ' + (me.username || r.username || '') + (me.roles ? '（' + me.roles.join('/') + '）' : '');
         await loadEnvs();
+        refreshBadge(); // 登录后立刻把未读角标拉起来，不必等第一个轮询周期
       } catch (e) {
         status('登录失败：' + e.message, true);
       }
+    }
+
+    // 环境状态：服务端四种状态各有含义，客户端必须分得开。
+    // stopped（停用）显示成「空闲」的话，运营点「启动环境」只会拿到服务端一句
+    // 「环境已停用，请先启用再启动」——而客户端根本没有「启用」按钮，那就是死路。
+    const ENV_STATUS = {
+      running: ['运行中', ''],      // 窗口开着（或客户端崩了还没被巡检收回）
+      idle: ['空闲', 'gray'],       // 关过窗口，可直接启动
+      created: ['未启动', 'gray'],  // 建好没开过
+      stopped: ['已停用', 'warn'],  // 退出服务，需先启用；停用已归还出口绑定
+    };
+
+    function statusTag(st) {
+      if (!st) return '';
+      const m = ENV_STATUS[st] || [st, 'gray'];
+      return ' <span class="tag ' + m[1] + '">' + escape(m[0]) + '</span>';
+    }
+
+    function errText(e) {
+      return e && e.message ? e.message : String(e);
     }
 
     async function loadEnvs() {
@@ -105,20 +182,47 @@
         let env = null;
         try { env = await api('/api/v1/shops/' + s.id + '/environment', { headers: auth }); } catch (_) { env = null; }
         const tr = document.createElement('tr');
-        const hasEnv = env && env.id;
+        const hasEnv = !!(env && env.id);
+        const st = hasEnv ? (env.status || '') : '';
         tr.innerHTML =
           '<td>' + escape(s.name) + '</td>' +
           '<td>' + escape(s.platform || '-') + ' / ' + escape(s.site || '-') + '</td>' +
           '<td>' + escape(s.status || '-') + '</td>' +
           '<td>' + (hasEnv
-            ? 'Chrome ' + env.kernel_major + ' · <span class="tag">' + String(env.baseline_hash || '').slice(0, 10) + '</span>'
+            ? 'Chrome ' + env.kernel_major + ' · <span class="tag">' + String(env.baseline_hash || '').slice(0, 10) + '</span>' +
+              // 环境是否在跑，是运营判断"这个店铺现在有没有人在操作"的依据；
+              // 关掉窗口不上报的话这里会永远显示运行中。
+              statusTag(st)
             : '<span class="tag gray">未创建环境</span>') + '</td>';
         const td = document.createElement('td');
-        const btn = document.createElement('button');
-        btn.textContent = hasEnv ? '启动环境' : '创建环境';
-        btn.disabled = !hasEnv;
-        btn.onclick = () => launch(s.id, s.name);
-        td.appendChild(btn);
+        const addBtn = (text, cls, fn, title) => {
+          const b = document.createElement('button');
+          if (cls) b.className = cls;
+          b.style.marginRight = '8px';
+          b.textContent = text;
+          if (title) b.title = title;
+          b.onclick = fn;
+          td.appendChild(b);
+        };
+        if (!hasEnv) {
+          // 没有环境时按钮必须可点：上一版写成 disabled = !hasEnv，
+          // 于是「创建环境」这个按钮永远点不动——运营只能回控制台建环境，
+          // 客户端等于少了一半功能，而这类 bug 只有真去点才会发现。
+          addBtn('创建环境', '', () => createEnv(s.id));
+        } else if (st === 'stopped') {
+          addBtn('启用', '', () => activateEnv(s.id), '停用的环境不参与启动，先启用');
+        } else {
+          addBtn('启动环境', '', () => launch(s.id, s.name));
+        }
+        if (hasEnv && st === 'running') {
+          addBtn('关闭环境', 'ghost', () => stopEnv(s.id));
+        }
+        if (hasEnv && st !== 'running' && st !== 'stopped') {
+          addBtn('停用', 'ghost', () => deactivateEnv(s.id), '停用会释放出口绑定（再启用后可能换 IP）');
+        }
+        if (hasEnv && st !== 'running') {
+          addBtn('删除', 'danger', () => deleteEnv(s.id, s.name), '删除不可逆：连本机 profile 一起清理');
+        }
         tr.appendChild(td);
         rows.appendChild(tr);
       }
@@ -142,12 +246,254 @@
       }
     }
 
+    // 创建环境：店铺还没有环境时在客户端直接建（服务端按国家挑画像与出口属地）。
+    // 建完刷新列表，让「创建环境」立刻变成「启动环境」——不给用户留一个
+    // "点了没反应"的窗口。
+    async function createEnv(shopId) {
+      status('正在创建环境…');
+      try {
+        await api('/api/v1/shops/' + shopId + '/environment', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer ' + spec.token }),
+          body: JSON.stringify({ country: ($('country').value || 'US').trim().toUpperCase(), url: '/client' }),
+        });
+        status('✓ 环境已创建');
+        await loadEnvs();
+      } catch (e) {
+        status('创建失败：' + (e && e.message ? e.message : String(e)), true);
+      }
+    }
+
+    async function stopEnv(shopId) {
+      status('正在关闭环境…');
+      try {
+        const r = await invoke('stop_env', {
+          input: { base_url: $('base').value, token: spec.token, shop_id: shopId },
+        });
+        status(r && r.reported
+          ? '✓ 环境已关闭（服务端状态已收回）'
+          : '✓ 窗口已关闭；服务端状态上报失败，将由巡检任务兜底收回');
+        await loadEnvs();
+      } catch (e) {
+        status('关闭失败：' + errText(e), true);
+      }
+    }
+
+    // 启用：stop 之后再回来。服务端按 env:deactivate 权限判，没有权限的人 403。
+    async function activateEnv(shopId) {
+      status('正在启用环境…');
+      try {
+        await api('/api/v1/shops/' + shopId + '/environment/activate', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+          body: JSON.stringify({ url: '/client' }),
+        });
+        status('✓ 环境已启用（停止期间出口绑定已归还，下次启动可能换出口 IP，服务端会发轮换告警）');
+        await loadEnvs();
+      } catch (e) {
+        status('启用失败：' + errText(e), true);
+      }
+    }
+
+    // 停用走 Rust 侧：本机还开着窗口时服务端看不见这件事（状态可能已被巡检收回），
+    // 必须先由客户端自己拦住，否则会留下「已停用、窗口和代理进程还在跑」的孤儿。
+    async function deactivateEnv(shopId) {
+      status('正在停用环境…');
+      try {
+        const st = await invoke('deactivate_env', {
+          input: { base_url: $('base').value, token: spec.token, shop_id: shopId },
+        });
+        status('✓ 环境已停用（' + (st || 'stopped') + '），出口绑定已交还代理商');
+        await loadEnvs();
+      } catch (e) {
+        status('停用失败：' + errText(e), true);
+      }
+    }
+
+    // 删除：不可逆，且会连本机 profile（Cookie/localStorage/IndexedDB）一起清掉，
+    // 所以必须二次确认——这类操作不能让运营在"手滑"的代价里学会谨慎。
+    async function deleteEnv(shopId, shopName) {
+      const ok = window.confirm(
+        '删除环境不可逆：\n' +
+        '· 服务端环境行（画像 / 基线 / 注入脚本）会被物理删除\n' +
+        '· 出口绑定会交还代理商\n' +
+        '· 本机 profile（Cookie / localStorage / IndexedDB）会一并清理\n\n' +
+        '确定删除「' + (shopName || shopId) + '」的环境？'
+      );
+      if (!ok) return;
+      status('正在删除环境…');
+      try {
+        const r = await invoke('delete_env', {
+          input: { base_url: $('base').value, token: spec.token, shop_id: shopId },
+        });
+        // 服务端删成功但本机目录没清干净，也要如实说出来（否则这就是一条静默的磁盘泄漏）
+        status((r && r.profile_purged ? '✓ 环境已删除，' : '✓ 环境已删除；') + ((r && r.note) || ''),
+          !!(r && !r.profile_purged));
+        await loadEnvs();
+      } catch (e) {
+        status('删除失败：' + errText(e), true);
+      }
+    }
+
     function escape(s) {
       return String(s === undefined ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     }
 
+    // ---------- 通知中心 ----------
+    // 为什么放在这里：运营的工作面就是这个窗口，通知只在后台控制台可见的话，
+    // 审批待办/委托申请这类"要人去点一下"的事就必然会漏。
+
+    const CHANNEL_LABEL = { email: '邮件通知', sms: '短信通知' };
+
+    function authHeaders() { return { Authorization: 'Bearer ' + spec.token }; }
+
+    function when(s) {
+      const d = new Date(s);
+      return isNaN(d.getTime()) ? '' : d.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    // 角标取服务端 COUNT 的真值，而不是"拉最近 50 条数一数"——后者在
+    // 未读超过一页时会显示错误的数字，等于把"还有没看的"藏起来了。
+    async function refreshBadge() {
+      if (!spec) return;
+      try {
+        const r = await api('/api/v1/notifications?limit=1', { headers: authHeaders() });
+        const n = r.unread || 0;
+        const el = $('badge');
+        el.textContent = n > 99 ? '99+' : String(n);
+        el.style.display = n ? 'inline-block' : 'none';
+      } catch (_) { /* 角标是锦上添花，失败了不要弹 Prima $ ERRO ~(log-in) */ }
+    }
+
+    async function loadNotifs() {
+      if (!spec) { status('请先登录', true); return; }
+      const list = $('notifList');
+      list.innerHTML = '<p class="hint">加载中…</p>';
+      try {
+        const r = await api('/api/v1/notifications?limit=50', { headers: authHeaders() });
+        const items = r.items || [];
+        list.innerHTML = '';
+        if (!items.length) {
+          list.innerHTML = '<p class="hint">暂无通知</p>';
+          return;
+        }
+        for (const n of items) {
+          const div = document.createElement('div');
+          div.className = 'notif' + (n.read_at ? '' : ' unread');
+          div.innerHTML =
+            '<div class="t">' + escape(n.title) + '</div>' +
+            '<div class="b">' + escape(n.body) + '</div>' +
+            '<div class="m">' + (n.read_at ? '' : '<span class="dot"></span><span>未读</span>') +
+            '<span>' + escape(when(n.created_at)) + '</span>' +
+            '<span class="hint">状态：' + escape(n.delivery_status || 'none') + '</span></div>';
+          if (!n.read_at) {
+            const btn = document.createElement('button');
+            btn.className = 'ghost';
+            btn.style.cssText = 'margin-left:auto;padding:2px 10px;font-size:12px';
+            btn.textContent = '标为已读';
+            btn.onclick = () => markRead(n.id);
+            div.querySelector('.m').appendChild(btn);
+          }
+          list.appendChild(div);
+        }
+      } catch (e) {
+        list.innerHTML = '<p class="hint">加载失败：' + escape(e.message) + '</p>';
+      }
+    }
+
+    async function markRead(id) {
+      try {
+        await api('/api/v1/notifications/' + encodeURIComponent(id) + '/read', {
+          method: 'POST', headers: authHeaders(),
+        });
+        await Promise.all([loadNotifs(), refreshBadge()]);
+      } catch (e) {
+        status('标记已读失败：' + e.message, true);
+      }
+    }
+
+    async function markAllRead() {
+      if (!spec) return;
+      try {
+        const r = await api('/api/v1/notifications?limit=200', { headers: authHeaders() });
+        const ids = (r.items || []).filter((n) => !n.read_at).map((n) => n.id);
+        for (const id of ids) {
+          await api('/api/v1/notifications/' + encodeURIComponent(id) + '/read', {
+            method: 'POST', headers: authHeaders(),
+          });
+        }
+        await Promise.all([loadNotifs(), refreshBadge()]);
+      } catch (e) {
+        status('全部已读失败：' + e.message, true);
+      }
+    }
+
+    function toggleDrawer(show) {
+      const d = $('drawer'), m = $('mask');
+      const on = show === undefined ? !d.classList.contains('show') : show;
+      d.classList.toggle('show', on);
+      m.classList.toggle('show', on);
+      if (on) loadNotifs();
+    }
+
+    // ---------- 通知偏好 ----------
+    let availChannels = [];
+
+    async function openPref() {
+      if (!spec) { status('请先登录', true); return; }
+      $('prefMsg').textContent = '';
+      try {
+        const r = await api('/api/v1/notifications/preferences', { headers: authHeaders() });
+        availChannels = r.available || [];
+        const enabled = r.channels || [];
+        const box = $('prefBox');
+        box.innerHTML = '';
+        if (!availChannels.length) {
+          box.innerHTML = '<p class="hint">服务端未装配任何个人可选的外发通道（仅站内信）</p>';
+        }
+        for (const ch of availChannels) {
+          const label = document.createElement('label');
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = ch;
+          cb.checked = enabled.indexOf(ch) >= 0;
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(CHANNEL_LABEL[ch] || ch));
+          box.appendChild(label);
+        }
+        $('prefDlg').showModal();
+      } catch (e) {
+        status('加载通知偏好失败：' + e.message, true);
+      }
+    }
+
+    async function savePref() {
+      const picked = Array.from($('prefBox').querySelectorAll('input[type=checkbox]'))
+        .filter((cb) => cb.checked).map((cb) => cb.value);
+      try {
+        await api('/api/v1/notifications/preferences', {
+          method: 'PUT',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+          body: JSON.stringify({ channels: picked }),
+        });
+        $('prefMsg').textContent = '✓ 已保存';
+        await refreshBadge();
+      } catch (e) {
+        $('prefMsg').textContent = '保存失败：' + e.message;
+      }
+    }
+
     $('login').onclick = login;
     $('reload').onclick = () => loadEnvs().catch((e) => status('刷新失败：' + e.message, true));
+    $('bell').onclick = () => toggleDrawer();
+    $('mask').onclick = () => toggleDrawer(false);
+    $('closeDrawer').onclick = () => toggleDrawer(false);
+    $('readAll').onclick = () => markAllRead();
+    $('pref').onclick = () => openPref();
+    $('prefSave').onclick = () => savePref();
+
+    // 轮询角标：60 秒一次，只在已登录时跑。
+    setInterval(() => { if (spec) refreshBadge(); }, 60000);
   </script>
 </body>
 </html>

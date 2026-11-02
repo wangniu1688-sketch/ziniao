@@ -38,3 +38,12 @@ profiles/
 *.crt
 *.key
 *.pem
+
+# ---- 数据根与临时目录（ZINIAO_DATA_DIR）----
+# data/ 下是真实环境的 profile、本地 CA 私钥、运行时注册表与日志；
+# tmp_probe/ 是实测时的临时 profile 目录（几百 MB）。
+# 两者都只有本机意义，入库既无价值又会夹带真实登录态。
+/data/
+/tmp_probe/
+/bin/
+/docs/evidence/

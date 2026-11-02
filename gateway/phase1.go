@@ -26,6 +26,8 @@ func (s *Server) routesPhase1() {
 	m.HandleFunc("POST /api/v1/devices/import", s.authed(s.handleDeviceImport))
 	m.HandleFunc("POST /api/v1/devices/{id}/bind", s.authed(s.handleDeviceBind))
 	m.HandleFunc("POST /api/v1/devices/{id}/renew", s.authed(s.handleDeviceRenew))
+	m.HandleFunc("POST /api/v1/devices/{id}/retire", s.authed(s.handleDeviceRetire))
+	m.HandleFunc("DELETE /api/v1/devices/{id}", s.authed(s.handleDeviceDelete))
 	m.HandleFunc("POST /api/v1/devices/{id}/acquire", s.authed(s.handleDeviceAcquire))
 	m.HandleFunc("POST /api/v1/devices/{id}/release", s.authed(s.handleDeviceRelease))
 	m.HandleFunc("GET /api/v1/devices/{id}/health", s.authed(s.handleDeviceHealth))
@@ -38,6 +40,10 @@ func (s *Server) routesPhase1() {
 	m.HandleFunc("GET /api/v1/shops/{id}/environment", s.authed(s.handleEnvGet))
 	m.HandleFunc("POST /api/v1/shops/{id}/environment/check", s.authed(s.handleEnvCheck))
 	m.HandleFunc("POST /api/v1/shops/{id}/environment/launch", s.authed(s.handleEnvLaunch))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment/stop", s.authed(s.handleEnvStopReport))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment/deactivate", s.authed(s.handleEnvDeactivate))
+	m.HandleFunc("POST /api/v1/shops/{id}/environment/activate", s.authed(s.handleEnvActivate))
+	m.HandleFunc("DELETE /api/v1/shops/{id}/environment", s.authed(s.handleEnvDelete))
 
 	m.HandleFunc("PUT /api/v1/shops/{id}/credentials", s.authed(s.handleCredPut))
 	m.HandleFunc("GET /api/v1/shops/{id}/credentials", s.authed(s.handleCredList))
@@ -105,11 +111,19 @@ func (s *Server) purchaseAmountCNY(ctx context.Context, tenantID string, months,
 // 这里刻意区分金额：小额零星申购不该走审批，否则日常操作被流程拖垮，
 // 最后的结果一定是大家想方设法绕过流程。阈值本身是可配置项。
 func (s *Server) purchaseNeedsApproval(ctx context.Context, tenantID string, months, count int) bool {
+	amount := s.purchaseAmountCNY(ctx, tenantID, months, count)
+	// 必须走审批服务的同一数据源：租户在控制台配了路由规则（改了金额门槛）之后，
+	// 这里若还按配置中心的旧阈值判断，就会出现「4 万的单网关说不用持证、
+	// 单据自己却要求双人复核」，或者更糟——配的门槛更低却根本没人去查规则。
+	if s.deps.Approvals != nil {
+		return s.deps.Approvals.NeedsTicketForAmount(ctx, tenantID,
+			types.ApprovalTypeDevicePurchase, amount)
+	}
 	threshold := config.Default().Limits.PurchaseOwnerThresholdCNY()
 	if s.deps.Config != nil {
 		threshold = s.deps.Config.Limits.PurchaseOwnerThresholdCNY()
 	}
-	return s.purchaseAmountCNY(ctx, tenantID, months, count) >= threshold
+	return amount >= threshold
 }
 
 // ticketAmountOf 取审批单上的金额（JSON 数字经反序列化为 float64）。
@@ -303,6 +317,46 @@ func (s *Server) handleDeviceRenew(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleDeviceRetire 设备退役：归还出口 + 停用。
+//
+// 权限与申购同级（device:retire）：退役会让绑在这台设备上的店铺一起失去出口，
+// 属于不可逆动作，不给普通运营。
+func (s *Server) handleDeviceRetire(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:retire", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	if err := s.deps.Device.Retire(r.Context(), r.PathValue("id"), p2subject(p, subj), terminalFrom(r)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleDeviceDelete 设备删除：台账出清 + 回退 device_count 配额，不可逆。
+// 只允许删除已退役/已过期的设备（服务层强校验）。
+func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "device:delete", "/devices")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Device == nil {
+		s.notWired(w)
+		return
+	}
+	if err := s.deps.Device.Delete(r.Context(), r.PathValue("id"), p2subject(p, subj), terminalFrom(r)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleDeviceAcquire(w http.ResponseWriter, r *http.Request) {
 	p, subj, _, err := s.authorize(r, "device:read", "/devices")
 	if err != nil {
@@ -486,7 +540,7 @@ func (s *Server) handleEnvCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnvGet(w http.ResponseWriter, r *http.Request) {
-	p, _, _, err := s.authorize(r, "env:check", "/shops")
+	p, subj, _, err := s.authorize(r, "env:check", "/shops")
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -495,7 +549,7 @@ func (s *Server) handleEnvGet(w http.ResponseWriter, r *http.Request) {
 		s.notWired(w)
 		return
 	}
-	env, err := s.deps.Environments.Get(r.Context(), p.TenantID, r.PathValue("id"))
+	env, err := s.deps.Environments.Get(r.Context(), p2subject(p, subj), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -530,8 +584,104 @@ func (s *Server) handleEnvLaunch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, spec)
 }
 
+// handleEnvStopReport 关闭环境：客户端关窗口 / 退出时上报，把状态从 running 收回 idle。
+//
+// 为什么值得单独一个接口而不是"反正没人看状态"：环境列表是运营判断
+// "这个店铺现在有没有人在操作"的依据，一屏永远 running 的环境等于这条信息作废。
+// 上报失败不影响窗口已经关掉的事实——客户端只做尽力上报，服务端另有巡检兜底。
+//
+// M3 起真实关窗口走 POST /api/v1/environments/{id}/stop（服务端直接关进程）；
+// 这里保留为旧客户端的「上报」通道（原样收回状态，不碰本机进程）。
+func (s *Server) handleEnvStopReport(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:stop", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	env, err := s.deps.Environments.StopEnv(r.Context(), shop.StopInput{
+		ShopID: r.PathValue("id"),
+		Actor:  p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+// handleEnvDeactivate / handleEnvActivate 停用与重新启用环境。
+//
+// 停用会释放出口绑定（Allocator.Release 的第二个触发点——此前只有到期 sweep
+// 一条路径），再启用后首次启动可能换 IP，那条告警由启动链路的 exit_ip_rotated 负责。
+func (s *Server) handleEnvDeactivate(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:deactivate", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	env, err := s.deps.Environments.Deactivate(r.Context(), shop.StopInput{
+		ShopID: r.PathValue("id"),
+		Actor:  p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+func (s *Server) handleEnvActivate(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:deactivate", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	env, err := s.deps.Environments.Activate(r.Context(), shop.StopInput{
+		ShopID: r.PathValue("id"),
+		Actor:  p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+// handleEnvDelete 删除环境（终态）：释放出口 + 物理删除行，不可逆。
+func (s *Server) handleEnvDelete(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "env:delete", "/shops")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Environments == nil {
+		s.notWired(w)
+		return
+	}
+	if err := s.deps.Environments.DeleteEnv(r.Context(), shop.StopInput{
+		ShopID: r.PathValue("id"),
+		Actor:  p2subject(p, subj), Terminal: terminalFrom(r), URL: "/shops",
+	}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleEnvCheck(w http.ResponseWriter, r *http.Request) {
-	p, _, _, err := s.authorize(r, "env:check", "/shops")
+	p, subj, _, err := s.authorize(r, "env:check", "/shops")
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -542,7 +692,7 @@ func (s *Server) handleEnvCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]string
 	_ = decodeJSON(r, &body)
-	report, err := s.deps.Environments.Check(r.Context(), p.TenantID, r.PathValue("id"), body)
+	report, err := s.deps.Environments.Check(r.Context(), p2subject(p, subj), r.PathValue("id"), body)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -584,7 +734,7 @@ func (s *Server) handleCredPut(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCredList(w http.ResponseWriter, r *http.Request) {
-	p, _, _, err := s.authorize(r, "shop:credential.manage", "/shops")
+	p, subj, _, err := s.authorize(r, "shop:credential.manage", "/shops")
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -593,7 +743,7 @@ func (s *Server) handleCredList(w http.ResponseWriter, r *http.Request) {
 		s.notWired(w)
 		return
 	}
-	kinds, err := s.deps.Vault.ListKinds(r.Context(), p.TenantID, r.PathValue("id"))
+	kinds, err := s.deps.Vault.ListKinds(r.Context(), p2subject(p, subj), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return

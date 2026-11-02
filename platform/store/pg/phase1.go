@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"ziniao/platform/apierr"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 )
@@ -73,6 +74,20 @@ func (r deviceRepo) Update(ctx context.Context, d *types.Device) error {
 			nullStr(d.OwnerID), nullStr(d.Protocol), nullStr(d.ProxyHost), d.ProxyPort, nullStr(d.ProxyUser),
 			nullStr(d.ProxySecretEnc), d.HealthScore, d.PurityScore, d.BoundAccounts, d.ConcurrentUsers,
 			d.MaxConcurrent, d.ExpiresAt, d.AutoRenew, time.Now(), d.DeletedAt)
+		return err
+	}))
+}
+
+// Delete 软删除（写 deleted_at，与 shops 同口径）。幂等：已删除的行原样返回成功。
+// 计量回退由服务层在同一事务内做，仓储不碰 usage_counters。
+func (r deviceRepo) Delete(ctx context.Context, id string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `UPDATE devices SET deleted_at=now(), updated_at=now()
+			WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, id, tid)
 		return err
 	}))
 }
@@ -266,6 +281,31 @@ func (r bindingRepo) Touch(ctx context.Context, id, userID string, at time.Time)
 
 // ---------- 环境 ----------
 
+// 写 environments 的三条语句（抽成常量：列名与占位符一一对应要能被一眼核对，
+// 也便于测试直接断言「占位符数 == 实参个数」）。
+//
+// 对照表（改任何一列都要同步改实参列表，execStmt 会在执行前校验）：
+//
+//	envInsertSQL    19 个占位符 / Create 传 19 个实参
+//	envUpdateSQL    18 个占位符 / Update 传 18 个实参（inject_script=$18）
+//	envSetStatusSQL  5 个占位符 / SetStatusIfIn 传 5 个实参（$5 = text[] 前置状态）
+const (
+	envInsertSQL = `INSERT INTO environments(id,tenant_id,shop_id,device_id,profile_id,baseline_hash,
+		kernel_major,tls_hello_id,status,snapshot,consistency,created_at,updated_at,
+		proxy_id,country,start_url,last_started_at,thumbnail_path,inject_script)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`
+
+	envUpdateSQL = `UPDATE environments SET shop_id=$3,device_id=$4,profile_id=$5,baseline_hash=$6,
+		kernel_major=$7,tls_hello_id=$8,status=$9,snapshot=$10,consistency=$11,updated_at=$12,
+		proxy_id=$13,country=$14,start_url=$15,last_started_at=$16,thumbnail_path=$17,
+		inject_script=$18 WHERE id=$1 AND tenant_id=$2`
+
+	envSetStatusSQL = `UPDATE environments SET status=$3,updated_at=$4
+		WHERE id=$1 AND tenant_id=$2 AND status = ANY($5)`
+
+	envDeleteSQL = `DELETE FROM environments WHERE id=$1 AND tenant_id=$2`
+)
+
 type envRepo struct{ base }
 
 func (r envRepo) Create(ctx context.Context, e *types.Environment) error {
@@ -282,11 +322,21 @@ func (r envRepo) Create(ctx context.Context, e *types.Environment) error {
 		if len(consistency) == 0 {
 			consistency = []byte("{}")
 		}
-		_, err = q.Exec(ctx, `INSERT INTO environments(id,tenant_id,shop_id,device_id,profile_id,baseline_hash,
-			kernel_major,tls_hello_id,status,snapshot,consistency,created_at,updated_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		// 0012：proxy_id / country / start_url / last_started_at / thumbnail_path
+		// 全部可空；last_started_at 为 NULL 表示「从未成功拉起」。
+		//
+		// inject_script 必须一并落库：它是环境指纹的**唯一载体**，启动链路不自己
+		// 现造脚本（现造 = 每次启动换一套指纹，等于没有画像）。漏写这一列的后果
+		// 极隐蔽——窗口照开、CDP 照连，但页面里全是本机真实指纹。
+		//
+		// 列名与实参必须成对出现：整句 INSERT 有 19 个占位符，就传 19 个实参。
+		// execStmt 会在执行前数一遍，少传一个直接报「哪句 SQL 少几个」而不是
+		// 让 Postgres 抛一句没有上下文的 mismatched param and argument count。
+		_, err = execStmt(ctx, q, envInsertSQL,
 			e.ID, tid, nullStr(e.ShopID), nullStr(e.DeviceID), e.ProfileID, e.BaselineHash,
-			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, e.CreatedAt, e.UpdatedAt)
+			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, e.CreatedAt, e.UpdatedAt,
+			nullStr(e.ProxyID), nullStr(e.Country), nullStr(e.StartURL), nullTime(e.LastStartedAt),
+			nullStr(e.ThumbnailPath), nullStr(e.InjectScript))
 		return err
 	}))
 }
@@ -298,19 +348,27 @@ func (r envRepo) Get(ctx context.Context, id string) (*types.Environment, error)
 	}
 	out := &types.Environment{TenantID: tid}
 	var snapshot, consistency []byte
+	var last time.Time
+	var script string
 	err = r.run(ctx, func(q querier) error {
 		return q.QueryRow(ctx, `SELECT id,COALESCE(shop_id,''),COALESCE(device_id,''),profile_id,baseline_hash,
-			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at
+			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at,
+			COALESCE(proxy_id,''),COALESCE(country,''),COALESCE(start_url,''),
+			COALESCE(last_started_at,'0001-01-01'::timestamptz),COALESCE(thumbnail_path,''),
+			COALESCE(inject_script,'')
 			FROM environments WHERE id=$1 AND tenant_id=$2`, id, tid).
 			Scan(&out.ID, &out.ShopID, &out.DeviceID, &out.ProfileID, &out.BaselineHash,
 				&out.KernelMajor, &out.TLSHelloID, &out.Status, &snapshot, &consistency,
-				&out.CreatedAt, &out.UpdatedAt)
+				&out.CreatedAt, &out.UpdatedAt,
+				&out.ProxyID, &out.Country, &out.StartURL, &last, &out.ThumbnailPath, &script)
 	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
 	_ = json.Unmarshal(snapshot, &out.Snapshot)
 	out.Consistency = consistency
+	out.LastStartedAt = timePtr(last)
+	out.InjectScript = script
 	return out, nil
 }
 
@@ -321,19 +379,27 @@ func (r envRepo) GetByShop(ctx context.Context, shopID string) (*types.Environme
 	}
 	out := &types.Environment{TenantID: tid}
 	var snapshot, consistency []byte
+	var last time.Time
+	var script string
 	err = r.run(ctx, func(q querier) error {
 		return q.QueryRow(ctx, `SELECT id,COALESCE(shop_id,''),COALESCE(device_id,''),profile_id,baseline_hash,
-			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at
+			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at,
+			COALESCE(proxy_id,''),COALESCE(country,''),COALESCE(start_url,''),
+			COALESCE(last_started_at,'0001-01-01'::timestamptz),COALESCE(thumbnail_path,''),
+			COALESCE(inject_script,'')
 			FROM environments WHERE shop_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1`, shopID, tid).
 			Scan(&out.ID, &out.ShopID, &out.DeviceID, &out.ProfileID, &out.BaselineHash,
 				&out.KernelMajor, &out.TLSHelloID, &out.Status, &snapshot, &consistency,
-				&out.CreatedAt, &out.UpdatedAt)
+				&out.CreatedAt, &out.UpdatedAt,
+				&out.ProxyID, &out.Country, &out.StartURL, &last, &out.ThumbnailPath, &script)
 	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
 	_ = json.Unmarshal(snapshot, &out.Snapshot)
 	out.Consistency = consistency
+	out.LastStartedAt = timePtr(last)
+	out.InjectScript = script
 	return out, nil
 }
 
@@ -351,12 +417,49 @@ func (r envRepo) Update(ctx context.Context, e *types.Environment) error {
 		if len(consistency) == 0 {
 			consistency = []byte("{}")
 		}
-		_, err = q.Exec(ctx, `UPDATE environments SET shop_id=$3,device_id=$4,profile_id=$5,baseline_hash=$6,
-			kernel_major=$7,tls_hello_id=$8,status=$9,snapshot=$10,consistency=$11,updated_at=$12 WHERE id=$1 AND tenant_id=$2`,
+		// 0012 列随整行一起更新（服务层保证语义：last_started_at 只在拉起成功时写）。
+		//
+		// inject_script 与 INSERT 同理：列名写了就必须传实参。上一版把列名加上了
+		// 却漏了实参（17 个实参对 18 个占位符），结果是 MarkRunning / MarkLaunchFailed
+		// 两条路径一起在阶段 8 报 mismatched param and argument count，环境悬在
+		// running 上。现在由 execStmt 兜住：再漏就当场报出哪句 SQL 少几个参数。
+		_, err = execStmt(ctx, q, envUpdateSQL,
 			e.ID, tid, nullStr(e.ShopID), nullStr(e.DeviceID), e.ProfileID, e.BaselineHash,
-			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, time.Now())
+			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, time.Now(),
+			nullStr(e.ProxyID), nullStr(e.Country), nullStr(e.StartURL),
+			nullTime(e.LastStartedAt), nullStr(e.ThumbnailPath), nullStr(e.InjectScript))
 		return err
 	}))
+}
+
+// SetStatusIfIn 只改状态的条件置位：仅当当前状态属于 from 时才置为 to。
+//
+// 为什么单独一条语句而不是复用 Update 整行写回：复位是**止损动作**，它的成功
+// 必须只依赖「状态」这一列。整行 UPDATE 涉及 18 列（含 inject_script 这种大字段），
+// 任何一列写错都会让「启动失败 → 复位」这条止损路径跟着崩，环境就悬在 running 上。
+//
+// 条件放在 SQL 里（而不是先读后写）是刻意的：读到的状态可能是几百毫秒前的，
+// 「绝不覆盖 running」这条铁律必须由**语句自己**保证。
+//
+// 返回是否命中：false = 当前状态不在 from 内（多半已经 running），一行未改。
+func (r envRepo) SetStatusIfIn(ctx context.Context, id string, from []string, to string) (bool, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return false, err
+	}
+	if to == "" || len(from) == 0 {
+		return false, apierr.Validation("状态置位缺少目标状态或前置状态集合")
+	}
+	changed := false
+	err = r.run(ctx, func(q querier) error {
+		tag, err := execStmt(ctx, q, envSetStatusSQL, id, tid, to, time.Now(), from)
+		if err != nil {
+			return err
+		}
+		changed = tag.RowsAffected() > 0
+		return nil
+	})
+	return changed, wrapErr(err)
 }
 
 func (r envRepo) List(ctx context.Context, limit, offset int) ([]types.Environment, int, error) {
@@ -374,7 +477,10 @@ func (r envRepo) List(ctx context.Context, limit, offset int) ([]types.Environme
 			return err
 		}
 		rows, err := q.Query(ctx, `SELECT id,COALESCE(shop_id,''),COALESCE(device_id,''),profile_id,baseline_hash,
-			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at FROM environments
+			kernel_major,COALESCE(tls_hello_id,''),status,snapshot,consistency,created_at,updated_at,
+			COALESCE(proxy_id,''),COALESCE(country,''),COALESCE(start_url,''),
+			COALESCE(last_started_at,'0001-01-01'::timestamptz),COALESCE(thumbnail_path,''),
+			COALESCE(inject_script,'') FROM environments
 			WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, tid, limit, offset)
 		if err != nil {
 			return err
@@ -383,19 +489,127 @@ func (r envRepo) List(ctx context.Context, limit, offset int) ([]types.Environme
 		for rows.Next() {
 			var e types.Environment
 			var snapshot, consistency []byte
+			var last time.Time
+			var script string
 			if err := rows.Scan(&e.ID, &e.ShopID, &e.DeviceID, &e.ProfileID, &e.BaselineHash,
 				&e.KernelMajor, &e.TLSHelloID, &e.Status, &snapshot, &consistency,
-				&e.CreatedAt, &e.UpdatedAt); err != nil {
+				&e.CreatedAt, &e.UpdatedAt,
+				&e.ProxyID, &e.Country, &e.StartURL, &last, &e.ThumbnailPath, &script); err != nil {
 				return err
 			}
 			_ = json.Unmarshal(snapshot, &e.Snapshot)
 			e.Consistency = consistency
+			e.LastStartedAt = timePtr(last)
 			e.TenantID = tid
 			out = append(out, e)
 		}
 		return rows.Err()
 	})
 	return out, total, wrapErr(err)
+}
+
+// Search 带过滤的聚合列表（M2 店铺网格页）：过滤条件全部下推到 SQL，
+// 与 mem 实现同口径（已软删店铺的环境不返回）。
+//
+// tenant_id 谓词显式带上（不只靠 RLS）：读路径的显式谓词才是防线，
+// RLS 是第二道（见 pg/launcher.go 顶部说明）。
+func (r envRepo) Search(ctx context.Context, f store.EnvironmentFilter) ([]types.Environment, int, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	where := `WHERE e.tenant_id=$1 AND s.deleted_at IS NULL`
+	args := []any{tid}
+	if len(f.ShopIDs) > 0 {
+		args = append(args, f.ShopIDs)
+		where += ` AND e.shop_id = ANY($` + itoa(len(args)) + `)`
+	}
+	if f.GroupID != "" {
+		args = append(args, f.GroupID)
+		where += ` AND s.group_id=$` + itoa(len(args))
+	}
+	if f.Platform != "" {
+		args = append(args, f.Platform)
+		where += ` AND s.platform=$` + itoa(len(args))
+	}
+	if f.Status != "" {
+		args = append(args, f.Status)
+		where += ` AND e.status=$` + itoa(len(args))
+	}
+	if f.Country != "" {
+		args = append(args, f.Country)
+		where += ` AND e.country=$` + itoa(len(args))
+	}
+	if f.ProxyID != "" {
+		args = append(args, f.ProxyID)
+		where += ` AND e.proxy_id=$` + itoa(len(args))
+	}
+	if kw := f.Keyword; kw != "" {
+		args = append(args, "%"+kw+"%")
+		n := itoa(len(args))
+		where += ` AND (s.name ILIKE $` + n + ` OR COALESCE(s.code,'') ILIKE $` + n +
+			` OR e.id ILIKE $` + n + `)`
+	}
+	cols := `e.id,e.tenant_id,COALESCE(e.shop_id,''),COALESCE(e.device_id,''),e.profile_id,e.baseline_hash,
+		e.kernel_major,COALESCE(e.tls_hello_id,''),e.status,e.snapshot,e.consistency,e.created_at,e.updated_at,
+		COALESCE(e.proxy_id,''),COALESCE(e.country,''),COALESCE(e.start_url,''),
+		COALESCE(e.last_started_at,'0001-01-01'::timestamptz),COALESCE(e.thumbnail_path,''),
+		COALESCE(e.inject_script,'')`
+	from := ` FROM environments e JOIN shops s ON s.id=e.shop_id AND s.tenant_id=e.tenant_id `
+	out := []types.Environment{}
+	total := 0
+	err = r.run(ctx, func(q querier) error {
+		if err := q.QueryRow(ctx, `SELECT COUNT(*)`+from+where, args...).Scan(&total); err != nil {
+			return err
+		}
+		paged := append(append([]any{}, args...), limit, offset)
+		rows, err := q.Query(ctx, `SELECT `+cols+from+where+
+			` ORDER BY e.created_at DESC LIMIT $`+itoa(len(paged)-1)+` OFFSET $`+itoa(len(paged)), paged...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e types.Environment
+			var snapshot, consistency []byte
+			var last time.Time
+			var script string
+			if err := rows.Scan(&e.ID, &e.TenantID, &e.ShopID, &e.DeviceID, &e.ProfileID, &e.BaselineHash,
+				&e.KernelMajor, &e.TLSHelloID, &e.Status, &snapshot, &consistency,
+				&e.CreatedAt, &e.UpdatedAt,
+				&e.ProxyID, &e.Country, &e.StartURL, &last, &e.ThumbnailPath, &script); err != nil {
+				return err
+			}
+			_ = json.Unmarshal(snapshot, &e.Snapshot)
+			e.Consistency = consistency
+			e.LastStartedAt = timePtr(last)
+			e.InjectScript = script
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, total, wrapErr(err)
+}
+
+// Delete 物理删除环境行（终态动作）。出口归还与事件留痕由服务层负责，仓储只删行。
+// 幂等：行不存在原样返回成功（重复删除不假成功靠上层事件与审计区分）。
+func (r envRepo) Delete(ctx context.Context, id string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := execStmt(ctx, q, envDeleteSQL, id, tid)
+		return err
+	}))
 }
 
 // ---------- 访问策略 ----------

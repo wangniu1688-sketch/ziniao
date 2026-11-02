@@ -105,12 +105,21 @@ func (e *Engine) Check(_ context.Context, req Request) Decision {
 	}
 
 	// 3) 页面级 + 元素级（按路径计算 DOM 屏蔽清单）
+	//
+	// 双层口径（M2 终审 T15）：
+	//   - 带 Action 的裁决 = 资源接口调用，闸门已经由第 1 步的功能/资源码定完，
+	//     页面码**不再二次拦截**——否则会出现"环境只读码给了 cs/agency_ops，
+	//     却因缺 page:environments 被页面层拦掉"的自相矛盾；
+	//   - 不带 Action 的裁决 = 纯页面导航，此时由 page:* 单独把关。
+	// 两种情况下元素级屏蔽清单照常计算，不受影响。
 	if req.Path != "" {
-		if pagePerm, ok := RequiredPage[req.Path]; ok && !perms[pagePerm] {
-			d.Allow = false
-			d.Layer = LayerPage
-			d.Reason = "missing_page_permission:" + pagePerm
-			return d
+		if req.Action == "" {
+			if pagePerm, ok := RequiredPage[req.Path]; ok && !perms[pagePerm] {
+				d.Allow = false
+				d.Layer = LayerPage
+				d.Reason = "missing_page_permission:" + pagePerm
+				return d
+			}
 		}
 		for _, el := range PageElements[req.Path] {
 			if !perms[el] {

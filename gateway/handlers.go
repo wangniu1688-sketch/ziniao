@@ -3,11 +3,13 @@ package gateway
 import (
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
 	"ziniao/audit"
 	"ziniao/iam"
+	"ziniao/notify"
 	"ziniao/platform/apierr"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
@@ -99,13 +101,33 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	for _, role := range p.Roles {
 		codes = append(codes, role.Code)
 	}
+	// permissions / nav 供前端做「画不画」：可见性只是体验，能不能仍由服务端资源码裁决。
+	// nav 的 visible 由资源/功能码算出（终审口径），page:* 不参与。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":    p.UserID,
-		"username":   p.Username,
-		"tenant_id":  p.TenantID,
-		"roles":      codes,
-		"data_scope": s.deps.IAM.Check(r.Context(), iam.Request{Subject: subj, Action: "shop:read"}).DataScope,
+		"user_id":     p.UserID,
+		"username":    p.Username,
+		"tenant_id":   p.TenantID,
+		"roles":       codes,
+		"permissions": unionRolePermissions(p.Roles),
+		"nav":         iam.NavFor(p.Roles),
+		"data_scope":  s.deps.IAM.Check(r.Context(), iam.Request{Subject: subj, Action: "shop:read"}).DataScope,
 	})
+}
+
+// unionRolePermissions 当前主体持有的权限码并集（已排序去重），仅用于前端可见性。
+func unionRolePermissions(roles []types.Role) []string {
+	set := map[string]bool{}
+	for _, r := range roles {
+		for _, c := range r.Permissions {
+			set[c] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------- 租户与成员 ----------
@@ -421,14 +443,71 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 通知 ----------
 
+// handleNotifyList 我的通知列表（含未读数，供客户端角标直接取真相，
+// 避免「把 50 条拉回来数」得出假未读数）。
 func (s *Server) handleNotifyList(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
-	items, err := s.deps.Notify.List(r.Context(), p.TenantID, p.UserID, intQuery(r, "limit", 50))
+	tctx := store.WithTenant(r.Context(), p.TenantID)
+	items, err := s.deps.Notify.List(tctx, p.TenantID, p.UserID, intQuery(r, "limit", 50))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
+	unread, err := s.deps.Notify.UnreadCount(tctx, p.TenantID, p.UserID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items), "unread": unread})
+}
+
+// notifySink 取通知 Sink；未装配时按既有约定回 503（notWired），
+// 而不是在这里打折出一个「假装成功」的偏好写的结果。
+func (s *Server) notifySink(w http.ResponseWriter) *notify.Sink {
+	if s.deps.NotifySink == nil {
+		s.notWired(w)
+		return nil
+	}
+	return s.deps.NotifySink
+}
+
+// handleNotifyPrefs 读取我的通知偏好（含可选清单）。
+func (s *Server) handleNotifyPrefsGet(w http.ResponseWriter, r *http.Request) {
+	sink := s.notifySink(w)
+	if sink == nil {
+		return
+	}
+	p, _ := principalFrom(r.Context())
+	tctx := store.WithTenant(r.Context(), p.TenantID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channels":  sink.EffectiveChannels(tctx, p.TenantID, p.UserID),
+		"available": sink.AvailableChannels(),
+	})
+}
+
+// handleNotifyPrefsPut 写入我的通知偏好（站内信恒开，只管外发通道）。
+func (s *Server) handleNotifyPrefsPut(w http.ResponseWriter, r *http.Request) {
+	sink := s.notifySink(w)
+	if sink == nil {
+		return
+	}
+	p, _ := principalFrom(r.Context())
+	var body struct {
+		Channels []string `json:"channels"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	tctx := store.WithTenant(r.Context(), p.TenantID)
+	if err := sink.SetChannels(tctx, p.TenantID, p.UserID, body.Channels); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channels": sink.EffectiveChannels(tctx, p.TenantID, p.UserID),
+		"ok":       true,
+	})
 }
 
 func (s *Server) handleNotifyRead(w http.ResponseWriter, r *http.Request) {

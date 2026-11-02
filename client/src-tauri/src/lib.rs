@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::process::{Child, Command};
 
 mod env_window;
+mod probe_shell;
 
 /// 本地前置代理（sidecar）句柄：一店一代理端口。
 struct ProxyHandle {
-    port: u16,
     child: Option<Child>,
 }
 
@@ -44,7 +44,6 @@ fn start_proxy(kernel_major: u16, device_host: String, device_port: u16) -> Resu
         .map_err(|e| format!("启动前置代理失败: {e}"))?;
     // 句柄需在应用状态中长期持有，此处为骨架示意（Drop 时回收进程）。
     let _handle = ProxyHandle {
-        port,
         child: Some(child),
     };
     Ok(port)
@@ -94,22 +93,76 @@ async fn launch_env(app: tauri::AppHandle, input: env_window::LaunchEnvInput) ->
     env_window::launch_env(app, input).await
 }
 
+/// stop_env：关闭店铺环境窗口并上报服务端（状态 running → idle）。
+#[tauri::command]
+async fn stop_env(
+    app: tauri::AppHandle,
+    input: env_window::StopEnvInput,
+) -> Result<env_window::StopEnvOutput, String> {
+    env_window::stop_env(app, input).await
+}
+
+/// env_nav：环境窗口工具条（browser.html）的导航命令（后退/前进/刷新/地址栏跳转）。
+///
+/// async 必须保留：Windows 上同步 command 里操作 webview 会死锁（WebView2 已知问题）。
+#[tauri::command]
+async fn env_nav(app: tauri::AppHandle, input: env_window::EnvNavInput) -> Result<(), String> {
+    env_window::env_nav(app, input)
+}
+
+/// deactivate_env：停用环境（退出服务，服务端归还出口绑定）。
+///
+/// 客户端不会因此关窗口：本机还开着窗口时这一条直接拒绝，
+/// 否则会留下「环境已停用、窗口与代理进程还在跑」的孤儿。
+#[tauri::command]
+async fn deactivate_env(
+    app: tauri::AppHandle,
+    input: env_window::StopEnvInput,
+) -> Result<String, String> {
+    env_window::deactivate_env(app, input).await
+}
+
+/// delete_env：删除环境（终态）——先收本机窗口，再删服务端行，最后清本机 profile。
+#[tauri::command]
+async fn delete_env(
+    app: tauri::AppHandle,
+    input: env_window::StopEnvInput,
+) -> Result<env_window::DeleteEnvOutput, String> {
+    env_window::delete_env(app, input).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let launch = cli_launch_spec(); // 支持 --server/--token/--launch-env 无人值守启动（便于自动化验证）
+    let cli = cli_spec(); // 支持 --server/--token/--launch-env/--delete-env 无人值守操作（便于自动化验证）
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             start_proxy,
             report_check,
             server_url,
-            launch_env
+            launch_env,
+            stop_env,
+            env_nav,
+            deactivate_env,
+            delete_env
         ])
         .setup(|app| {
-            if let Some(l) = launch {
+            // --probe-shell：打开多 webview 原型窗口做可行性验证（探路用，非生产路径）。
+            // 放在 async 任务里建 webview：Windows 上同步建 webview 会死锁（WebView2 已知问题）。
+            if std::env::args().any(|a| a == "--probe-shell") {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    if let Err(e) = probe_shell::run(&handle) {
+                        eprintln!("[probe] 原型失败: {e}");
+                        std::process::exit(1);
+                    }
+                });
+            }
+            if let Some(l) = cli {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                    for (shop, url) in l.shops {
+                    for (shop, url) in l.launches {
                         let input = env_window::LaunchEnvInput {
                             base_url: l.base_url.clone(),
                             token: l.token.clone(),
@@ -121,28 +174,80 @@ pub fn run() {
                             Err(e) => eprintln!("[ziniao] 启动失败: {e}"),
                         }
                     }
+                    // --deactivate-env：停用（服务端会归还出口绑定）。
+                    // 与 --launch-env 同进程时，「本机窗口还开着」这条守卫会生效——
+                    // 那是用例唯一能断言到的地方（跨进程看的是同一份登记表，不共享）。
+                    for shop in l.deactivates {
+                        let input = env_window::StopEnvInput {
+                            base_url: l.base_url.clone(),
+                            token: l.token.clone(),
+                            shop_id: shop,
+                        };
+                        match env_window::deactivate_env(handle.clone(), input).await {
+                            Ok(st) => eprintln!("[ziniao] 停用环境成功（{st}）"),
+                            Err(e) => eprintln!("[ziniao] 停用环境失败: {e}"),
+                        }
+                    }
+                    // --delete-env：无人值守走完「收窗口 → 删服务端行 → 清本机 profile」。
+                    // 这条链是不可逆操作，只靠人手点一次不算验证过。
+                    for shop in l.deletes {
+                        let input = env_window::StopEnvInput {
+                            base_url: l.base_url.clone(),
+                            token: l.token.clone(),
+                            shop_id: shop,
+                        };
+                        match env_window::delete_env(handle.clone(), input).await {
+                            Ok(r) => eprintln!(
+                                "[ziniao] 删除环境 {} 成功（profile_purged={}）：{}",
+                                r.env_id, r.profile_purged, r.note
+                            ),
+                            Err(e) => eprintln!("[ziniao] 删除环境失败: {e}"),
+                        }
+                    }
                 });
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("启动紫鸟客户端失败");
+        .build(tauri::generate_context!())
+        .expect("启动紫鸟客户端失败")
+        .run(|app, event| {
+            // 进程退出：把仍打开的环境逐个上报关闭。
+            // 尽力而为——退出时异步任务未必跑得完，断电/强杀更是一点机会都没有，
+            // 所以服务端还有巡检兜底（env.reclaim，默认 12 小时）。
+            // 不做这一步，上面每个窗口都要等 12 小时才被收回。
+            if let tauri::RunEvent::Exit = event {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    env_window::stop_all_open(handle).await;
+                });
+            }
+        });
 }
 
-/// CliLaunch 命令行无人值守启动参数。
-struct CliLaunch {
+/// CliSpec 命令行无人值守操作参数。
+struct CliSpec {
     base_url: String,
     token: String,
-    /// shops: (shop_id, 可选的目标 URL)——支持 `--launch-env <shopID>::<url>` 逐环境指定目标页
-    shops: Vec<(String, Option<String>)>,
+    /// launches: (shop_id, 可选的目标 URL)——`--launch-env <shopID>::<url>` 逐环境指定目标页
+    launches: Vec<(String, Option<String>)>,
+    /// deactivates: `--deactivate-env <shopID>`（可重复）——与 --launch-env 同进程时
+    /// 正好能验证「本机窗口还开着 → 拒绝停用」这条守卫
+    deactivates: Vec<String>,
+    /// deletes: `--delete-env <shopID>`（可重复）走完整删除链，供回归 harness 使用
+    deletes: Vec<String>,
 }
 
-/// cli_launch_spec 解析 `--server <url> --token <jwt> --launch-env <shopID>[::<url>]`（可重复）。
-fn cli_launch_spec() -> Option<CliLaunch> {
+/// cli_spec 解析 `--server <url> --token <jwt> --launch-env <shopID>[::<url>] --delete-env <shopID>`。
+///
+/// 只认「两个独立参数」：`--launch-env=<id>` 会被静默跳过（解析器不认 `=` 形式），
+/// 无人值守启动第一次就栽在这，表现为"客户端起来了但什么都没发生"。
+fn cli_spec() -> Option<CliSpec> {
     let args: Vec<String> = std::env::args().collect();
     let mut base = None;
     let mut token = None;
-    let mut shops: Vec<(String, Option<String>)> = Vec::new();
+    let mut launches: Vec<(String, Option<String>)> = Vec::new();
+    let mut deactivates: Vec<String> = Vec::new();
+    let mut deletes: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -157,17 +262,31 @@ fn cli_launch_spec() -> Option<CliLaunch> {
             "--launch-env" if i + 1 < args.len() => {
                 let raw = args[i + 1].clone();
                 match raw.split_once("::") {
-                    Some((id, url)) => shops.push((id.to_string(), Some(url.to_string()))),
-                    None => shops.push((raw, None)),
+                    Some((id, url)) => launches.push((id.to_string(), Some(url.to_string()))),
+                    None => launches.push((raw, None)),
                 }
+                i += 2;
+            }
+            "--deactivate-env" if i + 1 < args.len() => {
+                deactivates.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--delete-env" if i + 1 < args.len() => {
+                deletes.push(args[i + 1].clone());
                 i += 2;
             }
             _ => i += 1,
         }
     }
     if let (Some(base_url), Some(token)) = (base, token) {
-        if !shops.is_empty() {
-            return Some(CliLaunch { base_url, token, shops });
+        if !launches.is_empty() || !deactivates.is_empty() || !deletes.is_empty() {
+            return Some(CliSpec {
+                base_url,
+                token,
+                launches,
+                deactivates,
+                deletes,
+            });
         }
     }
     None

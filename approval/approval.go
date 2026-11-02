@@ -95,7 +95,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*types.ApprovalTi
 	for _, a := range approvers {
 		approverIDs = append(approverIDs, a.UserID)
 	}
-	req := s.RequiredFor(t)
+	req := s.RequiredFor(ctx, t)
 	tctx := store.WithTenant(ctx, in.Actor.TenantID)
 	if err := s.st.WithTx(tctx, func(tx store.Tx) error {
 		if err := tx.Approvals().Create(tctx, t); err != nil {
@@ -110,6 +110,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*types.ApprovalTi
 				"ticket_id": t.ID, "type": t.Type, "subject_id": t.SubjectID,
 				"approver_ids": approverIDs, "required_roles": req.Roles,
 				"min_approvers": req.MinApprovers, "requirement": req.Reason,
+				"rule_source": req.Source, "rule_id": req.RuleID,
 			},
 		})
 	}); err != nil {
@@ -176,12 +177,12 @@ func (s *Service) decide(ctx context.Context, in DecideInput, status types.Appro
 	}
 	// 路由准入：光有 approval:approve 权限不够，还得是这条单要求的角色。
 	// 否则一个普通运营就能批准「导出全量审计日志」「查看店铺主账号口令」。
-	if err := s.CanApprove(t, in.Actor); err != nil {
+	if err := s.CanApprove(ctx, t, in.Actor); err != nil {
 		return nil, err
 	}
 	// 会签：未达法定人数前只记签署，工单保持 pending。
 	if status == types.ApprovalApproved {
-		if need := s.RequiredFor(t).MinApprovers; need > 1 {
+		if need := s.RequiredFor(ctx, t).MinApprovers; need > 1 {
 			sigs, ok := addSignature(t, in.Actor)
 			if !ok {
 				return nil, apierr.Conflict("你已签署该审批单，请勿重复操作")

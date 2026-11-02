@@ -113,36 +113,67 @@ func main() {
 // 那时会走轮换告警——让运营看见，而不是静默换 IP。
 func wireIPPool(ctx context.Context, log *slog.Logger, a *app.App,
 	base, acquirePath, releasePath, attachPath, auth, proto string, lease time.Duration) {
-	if strings.TrimSpace(base) == "" {
+	if strings.TrimSpace(base) == "" && strings.TrimSpace(os.Getenv("ZINIAO_IP_VENDORS")) == "" {
 		log.Warn("未配置住宅代理商：所有环境共用本机公网出口，多账号存在关联风险",
-			"hint", "-ip-base-url + ZINIAO_IP_TOKEN")
+			"hint", "-ip-base-url + ZINIAO_IP_TOKEN（多家时用 ZINIAO_IP_VENDORS）")
 		return
 	}
-	token := strings.TrimSpace(os.Getenv("ZINIAO_IP_TOKEN"))
-	if token == "" {
-		log.Error("已配置代理商但未设置 ZINIAO_IP_TOKEN，出口 IP 池未启用")
+	// 共用部分（路径/鉴权/协议）走启动参数，各家差异（基址/凭据/国家/权重）走环境变量。
+	specs, err := network.LoadVendorSpecs(network.VendorConfig{
+		BaseURL:     base,
+		AuthStyle:   auth,
+		AcquirePath: acquirePath, ReleasePath: releasePath, AttachPath: attachPath,
+		Protocol: network.Protocol(proto), Timeout: 15 * time.Second,
+	}, strings.TrimSpace(os.Getenv("ZINIAO_IP_TOKEN")))
+	if err != nil {
+		log.Error("代理商配置不完整，出口 IP 池未启用", "err", err.Error())
 		return
 	}
-	p := network.NewHTTPProvider(network.VendorConfig{
-		Name: "ip-vendor", BaseURL: base, Token: token,
-		AuthStyle: auth, AcquirePath: acquirePath, ReleasePath: releasePath,
-		AttachPath: attachPath,
-		Protocol:   network.Protocol(proto), Timeout: 15 * time.Second,
-	})
-	if err := p.Health(ctx); err != nil {
-		log.Error("代理商健康检查失败，出口 IP 池未启用", "err", err.Error())
+	// 逐家体检再入表：健康检查不过的那家直接不参与路由，
+	// 而不是进表后被连续失败熔断——启动时就该把话说清楚。
+	rt := network.NewRouter()
+	ready := 0
+	for _, s := range specs {
+		p := network.NewHTTPProvider(s.VendorConfig)
+		if herr := p.Health(ctx); herr != nil {
+			log.Error("代理商健康检查失败，已排除在路由表之外", "vendor", s.VendorMeta.Name, "err", herr.Error())
+			continue
+		}
+		if aerr := rt.Add(network.Vendor{Provider: p, Meta: s.VendorMeta}); aerr != nil {
+			log.Error("代理商登记失败", "vendor", s.VendorMeta.Name, "err", aerr.Error())
+			continue
+		}
+		ready++
+	}
+	if ready == 0 {
+		log.Error("没有可用的住宅代理商，出口 IP 池未启用")
 		return
 	}
-	alloc := network.NewAllocator(p, lease)
+	alloc := network.NewAllocatorWithRouter(rt, lease)
 	alloc.SetLogger(log)
 	// 绑定落库：没有它，每次重启都会给全部店铺换一次出口 IP。
+	// 多代理商下它还多担一件事：记下这条出口是哪家签发的（provider 列），
+	// 归还与重启复用都靠它认人。
 	alloc.SetBindingStore(a.Store.EgressBindings())
+	// 历史留档：当前绑定只能回答「现在用的哪个出口」，
+	// 而「两个店铺先后有没有用过同一 ASN」必须靠事件化才查得出来。
+	// 写失败只告警不阻塞分配（历史是可观测性，不该变成可用性风险）。
+	alloc.SetHistoryStore(a.Store.EgressBindings())
 	a.SetIPPool(alloc)
+	// 名额回填必须在池子接上之后、第一个请求进来之前：
+	// 库里的绑定（设备按月租、环境跨重启复用）在上一个进程里各占着一格配额，
+	// 不回填就等于重启后的一段时间里名额无限，代理商那边已经满额我们还继续派单。
+	if n, err := a.RestoreEgressQuota(ctx); err != nil {
+		log.Error("回填出口名额失败（代理商配额可能超卖）", "err", err)
+	} else if n > 0 {
+		log.Info("已按库里的既存绑定回填出口名额", "count", n)
+	}
 	a.StartIPReaper(ctx, 10*time.Minute)
 	if strings.TrimSpace(attachPath) == "" {
 		log.Warn("未配置 -ip-attach-path：重启后无法向代理商取回既有出口，" +
 			"环境会被重新分配（每次发布都会触发一次出口轮换告警）")
 	}
 	log.Info("住宅代理商出口池已就绪（逐环境独立出口，绑定已落库）",
-		"protocol", proto, "lease", lease.String(), "attach", attachPath != "")
+		"protocol", proto, "lease", lease.String(), "attach", attachPath != "",
+		"vendors", rt.Snapshot())
 }

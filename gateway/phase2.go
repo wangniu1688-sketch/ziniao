@@ -21,6 +21,9 @@ func (s *Server) routesPhase2() {
 	m.HandleFunc("POST /api/v1/approvals/{id}/approve", s.authed(s.handleApprovalApprove))
 	m.HandleFunc("POST /api/v1/approvals/{id}/reject", s.authed(s.handleApprovalReject))
 	m.HandleFunc("POST /api/v1/approvals/{id}/cancel", s.authed(s.handleApprovalCancel))
+	m.HandleFunc("GET /api/v1/approvals/rules", s.authed(s.handleApprovalRuleList))
+	m.HandleFunc("POST /api/v1/approvals/rules", s.authed(s.handleApprovalRuleUpsert))
+	m.HandleFunc("DELETE /api/v1/approvals/rules/{id}", s.authed(s.handleApprovalRuleDelete))
 
 	m.HandleFunc("GET /api/v1/jobs", s.authed(s.handleJobList))
 	m.HandleFunc("POST /api/v1/jobs/run", s.authed(s.handleJobRun))
@@ -175,6 +178,87 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+// ---------- 审批路由规则（可配置） ----------
+
+// handleApprovalRuleList 列出租户规则，同时返回内置规则清单——
+// 没有内置那一份，运营无法判断「删掉这条之后会变成什么样」。
+func (s *Server) handleApprovalRuleList(w http.ResponseWriter, r *http.Request) {
+	_, subj, _, err := s.authorize(r, "approval:route.read", "/approvals")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Approvals == nil {
+		s.notWired(w)
+		return
+	}
+	items, err := s.deps.Approvals.ListRules(r.Context(), subj, "/approvals")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":   items,
+		"builtin": s.deps.Approvals.BuiltinRules(),
+	})
+}
+
+func (s *Server) handleApprovalRuleUpsert(w http.ResponseWriter, r *http.Request) {
+	_, subj, _, err := s.authorize(r, "approval:route.manage", "/approvals")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Approvals == nil {
+		s.notWired(w)
+		return
+	}
+	var body struct {
+		ID           string   `json:"id"`
+		TicketType   string   `json:"ticket_type"`
+		MinAmount    float64  `json:"min_amount"`
+		Roles        []string `json:"roles"`
+		MinApprovers int      `json:"min_approvers"`
+		Reason       string   `json:"reason"`
+		Priority     int      `json:"priority"`
+		Enabled      *bool    `json:"enabled"`
+		URL          string   `json:"url"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, apierr.Validation("请求体格式错误"))
+		return
+	}
+	rule, err := s.deps.Approvals.UpsertRule(r.Context(), approval.RuleInput{
+		ID: body.ID, TicketType: body.TicketType, MinAmount: body.MinAmount,
+		Roles: body.Roles, MinApprovers: body.MinApprovers, Reason: body.Reason,
+		Priority: body.Priority, Enabled: body.Enabled,
+		Actor: subj, Terminal: terminalFrom(r), URL: orDefault(body.URL, "/approvals"),
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+func (s *Server) handleApprovalRuleDelete(w http.ResponseWriter, r *http.Request) {
+	_, subj, _, err := s.authorize(r, "approval:route.manage", "/approvals")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Approvals == nil {
+		s.notWired(w)
+		return
+	}
+	if err := s.deps.Approvals.DeleteRule(r.Context(), subj, r.PathValue("id"),
+		terminalFrom(r), "/approvals"); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ---------- 定时任务 ----------

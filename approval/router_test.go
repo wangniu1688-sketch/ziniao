@@ -31,7 +31,7 @@ func TestRequiredForRouting(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := e.svc.RequiredFor(tc.ticket)
+			got := e.svc.RequiredFor(context.Background(), tc.ticket)
 			if len(got.Roles) != len(tc.wantRoles) {
 				t.Fatalf("要求角色应为 %v，实际 %v", tc.wantRoles, got.Roles)
 			}
@@ -45,6 +45,10 @@ func TestRequiredForRouting(t *testing.T) {
 			}
 			if got.Reason == "" {
 				t.Fatal("必须给出可读原因：申请人需要知道这条单为什么要求这个级别")
+			}
+			// 未配置规则时必须走内置：老租户升级后行为不变，这条是最容易被改坏的
+			if got.Source != "builtin" {
+				t.Fatalf("无租户规则时应走内置规则，实际 source=%s", got.Source)
 			}
 		})
 	}

@@ -53,6 +53,11 @@ type Limits struct {
 	LoginAllowedStartHour int           `key:"auth.login_allowed_start_hour"` // 0-24，0&24=不限
 	LoginAllowedEndHour   int           `key:"auth.login_allowed_end_hour"`
 
+	// 环境回收：running 状态超过这个时长仍无关闭上报，巡检任务把它置回 idle。
+	// 这是"客户端崩溃/断电来不及上报"的兜底，不是精确判定——
+	// 取得太小会把正在挂机的环境误判成空闲（只影响状态显示，不影响运行中的窗口）。
+	EnvReclaimHours int `key:"env.reclaim_hours"` // 12
+
 	// Agent 人工确认闸门（M19.2）
 	AgentConfirmTTLSeconds int      `key:"agent.confirm_ttl_seconds"` // 1800
 	AgentAlwaysConfirmOps  []string `key:"agent.always_confirm_ops"`  // withdraw|price_change|bulk_delete|account_change
@@ -68,6 +73,11 @@ type Limits struct {
 	ShopTrashRetentionDays int `key:"shop.trash_retention_days"` // 30
 	DeviceExpireWarnDays   int `key:"device.expire_warn_days"`   // 7
 	DeviceHealthMinScore   int `key:"device.health_min_score"`   // 60
+
+	// 出口绑定历史保留期（Phase 2D）：超过该天数的 egress_binding_history 行由
+	// network.egress_history_prune 物理裁剪。<= 0 表示不裁剪（历史是资产，
+	// 共用 ASN 的证据链怕断不怕长）；默认 180 与审计留存对齐。
+	EgressHistoryRetentionDays int `key:"egress.history_retention_days"` // 180
 
 	// 网关
 	APIRatePerMinute  int `key:"api.rate_per_minute"`
@@ -98,19 +108,70 @@ type Notify struct {
 	WebhookMaxRetry      int           `key:"notify.webhook_max_retry"`
 	WebhookAllowLoopback bool          `key:"notify.webhook_allow_loopback"` // dev/local only
 
+	// 短信（阿里云云市场「阿里短信服务」，AppKey+AppSecret 签名认证）。
+	// 与邮件同一口径：AppKey/AppSecret 只经环境变量注入，不进 argv、不进日志、
+	// 不出现在任何 API 响应里。
+	SMSProvider      string        `key:"notify.sms_provider"` // aliyun_market（默认）
+	SMSAppKey        string        `key:"notify.sms_app_key"`  // 留空 = 短信通道关闭
+	SMSAppSecret     string        `key:"notify.sms_app_secret"`
+	SMSSignName      string        `key:"notify.sms_sign_name"`     // 控制台审核通过的签名
+	SMSTemplateCode  string        `key:"notify.sms_template_code"` // 如 SMS_492460356
+	SMSTemplateKey   string        `key:"notify.sms_template_key"`  // 模板变量名，默认 content
+	SMSTimeout       time.Duration `key:"notify.sms_timeout"`
+	SMSMaxRetry      int           `key:"notify.sms_max_retry"`      // 默认 0：宁可漏发也不重复发
+	SMSAllowLoopback bool          `key:"notify.sms_allow_loopback"` // dev/local only
+
 	MaxAttempts int    // 含首次在内的单通道投递上限，超过后留给重投任务并最终置 failed
 	MinRisk     string // high（默认）| medium
 }
 
+// SMSConfigured 是否配置了短信通道的**任一项**。
+//
+// 用于识别"半配置"：填了 AppKey 却没填模板 CODE 的通道看起来配过、实际一发就 400，
+// 运营会以为告警已经发出去了——这比不配更糟，必须在启动装配阶段就炸出来。
+func (n Notify) SMSConfigured() bool {
+	return n.SMSAppKey != "" || n.SMSAppSecret != "" || n.SMSSignName != "" || n.SMSTemplateCode != ""
+}
+
 // Config 进程级配置。
 type Config struct {
-	Env         string `key:"env"` // dev|test|prod
+	Env string `key:"env"` // dev|test|prod
+	// HTTPAddr 监听地址。默认只绑回环（127.0.0.1:8080）：启动器是本机桌面形态，
+	// 绑 0.0.0.0 会把本地 CDP / 本地代理 / 控制台一起暴露到局域网。
 	HTTPAddr    string `key:"http.addr"`
 	StoreDriver string `key:"store.driver"` // memory|postgres
 	PostgresDSN string `key:"store.postgres_dsn"`
 	JWTSecret   string `key:"auth.jwt_secret"`
+
+	// DataDir 数据根目录（M1）。profiles / extensions / runtime / logs / ca 都落在它下面。
+	// 相对路径在装配阶段统一转绝对路径，避免「进程换了工作目录就换了数据目录」。
+	DataDir string `key:"data.dir"`
+	// CADir MITM 根证书目录；留空回落到 $DataDir/ca。
+	CADir string `key:"ca.dir"`
+	// ChromePath 浏览器可执行文件覆盖（自动探测不到时手工指定）。
+	ChromePath string `key:"browser.chrome_path"`
+	// Sidepanel 是否在启动参数里加载侧边栏扩展。默认 false：未打包扩展会触发
+	// Chrome 的「请停用开发者模式扩展」提示条，干扰指纹验收观感。
+	Sidepanel bool `key:"browser.sidepanel"`
 	// Demo 站点：账号隔离实测用（/demo/*）。生产必须为 false。
 	DemoSite bool `key:"demo_site"`
+	// ProxyTestEnabled 服务端代理拨测总开关（M2 收尾 / T12；P3 口径见下）。
+	//
+	// on（默认）= 严格：绑定代理前与启动绑定了代理的环境前都要拨测，
+	//   fail 即阻断（拒绝绑定 / 拒绝启动）。
+	// off = 跳过健康校验：允许绑定、允许启动（不拨测），只在日志与审计留 WARN。
+	//   off 的语义是「这条出网路径被部署侧摘除」，不是「代理不通」——
+	//   因此 off **绝不能**被判成 fail，也不能因此禁止绑定或启动。
+	ProxyTestEnabled bool `key:"proxy.test_enabled"`
+	// ProxyTestTarget 拨测默认目标（部署侧可换成内网可达的纯 IP 回显服务）。
+	ProxyTestTarget string `key:"proxy.test_target"`
+	// ProxyTestCountryTarget 出口国家实测目标（P3），**默认空 = 不实测**。
+	//
+	// 空：不额外出网，exit_country 沿用台账录入的 country，一致性软校验也用它。
+	// 非空（如 https://ipinfo.io/json）：拨测时再取一次 JSON 里的 country 字段。
+	// 实测失败**不致命**：国家拿不到就留空并记 WARN，不得拖垮拨测与启动——
+	// 为了一个展示字段把环境挡在启动之外，是典型的「辅助信息绑架主流程」。
+	ProxyTestCountryTarget string `key:"proxy.test_country_target"`
 	// 事件总线
 	DispatcherBatchSize int           `key:"bus.batch_size"`
 	DispatcherInterval  time.Duration `key:"bus.interval"`
@@ -123,8 +184,16 @@ type Config struct {
 // Default 返回带合理默认值的配置（未标注规格数值的部分按 TODO 处理）。
 func Default() *Config {
 	return &Config{
-		Env:                 "dev",
-		HTTPAddr:            ":8080",
+		Env:      "dev",
+		HTTPAddr: "127.0.0.1:8080",
+		DataDir:  "./data",
+		// CA 目录留空 → 装配阶段回落到 $DataDir/ca（见 browser 包 Layout）。
+		CADir:               "",
+		Sidepanel:           false,
+		ProxyTestEnabled:    true,
+		ProxyTestTarget:     "https://api.ipify.org",
+		// 国家实测默认关：多一次外部请求 = 多一个拨测失败点，而它只影响展示。
+		ProxyTestCountryTarget: "",
 		StoreDriver:         "memory",
 		PostgresDSN:         "postgres://ziniao:ziniao@localhost:5432/ziniao?sslmode=disable",
 		JWTSecret:           "dev-only-secret-change-me",
@@ -164,8 +233,10 @@ func Default() *Config {
 				"audit.export.plain", "shop.credential.reveal", "shop.bulk_delete",
 			},
 			ShopTrashRetentionDays:     30,
+			EnvReclaimHours:            12,
 			DeviceExpireWarnDays:       7,
 			DeviceHealthMinScore:       60,
+			EgressHistoryRetentionDays: 180,
 			APIRatePerMinute:           600,
 			APIDailyQuotaFree:          1000,
 			RecordingRetentionDaysFree: 7,
@@ -179,8 +250,13 @@ func Default() *Config {
 			WebhookURL:      "",
 			WebhookTimeout:  5 * time.Second,
 			WebhookMaxRetry: 2,
-			MaxAttempts:     3,
-			MinRisk:         "high",
+			SMSProvider:     "aliyun_market",
+			SMSTimeout:      5 * time.Second,
+			// 短信默认**不重试**：超时失败往往意味着对方其实已收下，再发一次就是把
+			// 同一条告警发两遍（重复扣费 + 把人烦到静音）。漏发交给重投任务兜底。
+			SMSMaxRetry: 0,
+			MaxAttempts: 3,
+			MinRisk:     "high",
 		},
 	}
 }
@@ -194,6 +270,11 @@ func Load() *Config {
 	c.PostgresDSN = envStr("ZINIAO_POSTGRES_DSN", c.PostgresDSN)
 	c.JWTSecret = envStr("ZINIAO_JWT_SECRET", c.JWTSecret)
 	c.DemoSite = envBool("ZINIAO_DEMO_SITE", c.DemoSite)
+	// 启动器内核（M1）
+	c.DataDir = envStr("ZINIAO_DATA_DIR", c.DataDir)
+	c.CADir = envStr("ZINIAO_CA_DIR", c.CADir)
+	c.ChromePath = envStr("ZINIAO_CHROME_PATH", c.ChromePath)
+	c.Sidepanel = envBool("ZINIAO_SIDEPANEL", c.Sidepanel)
 	c.DispatcherBatchSize = envInt("ZINIAO_BUS_BATCH", c.DispatcherBatchSize)
 	c.DispatcherInterval = envDur("ZINIAO_BUS_INTERVAL", c.DispatcherInterval)
 	c.DispatcherMaxRetry = envInt("ZINIAO_BUS_MAX_RETRY", c.DispatcherMaxRetry)
@@ -206,6 +287,8 @@ func Load() *Config {
 	l.ExportMaxRows = envInt("ZINIAO_LIMIT_EXPORT_MAX_ROWS", l.ExportMaxRows)
 	l.APIRatePerMinute = envInt("ZINIAO_LIMIT_API_RATE_PER_MINUTE", l.APIRatePerMinute)
 	l.DevicePurchaseOwnerThresholdCNY = envFloat("ZINIAO_LIMIT_DEVICE_PURCHASE_THRESHOLD_CNY", l.DevicePurchaseOwnerThresholdCNY)
+	l.EnvReclaimHours = envInt("ZINIAO_LIMIT_ENV_RECLAIM_HOURS", l.EnvReclaimHours)
+	l.EgressHistoryRetentionDays = envInt("ZINIAO_LIMIT_EGRESS_HISTORY_RETENTION_DAYS", l.EgressHistoryRetentionDays)
 	// 外发通道：凭据只走环境变量（详见 Notify 注释）
 	n := &c.Notify
 	n.SMTPHost = envStr("ZINIAO_SMTP_HOST", n.SMTPHost)
@@ -220,9 +303,35 @@ func Load() *Config {
 	n.WebhookTimeout = envDur("ZINIAO_WEBHOOK_TIMEOUT", n.WebhookTimeout)
 	n.WebhookMaxRetry = envInt("ZINIAO_WEBHOOK_MAX_RETRY", n.WebhookMaxRetry)
 	n.WebhookAllowLoopback = envBool("ZINIAO_WEBHOOK_ALLOW_LOOPBACK", n.WebhookAllowLoopback)
+	n.SMSProvider = envStr("ZINIAO_SMS_PROVIDER", n.SMSProvider)
+	n.SMSAppKey = envStr("ZINIAO_SMS_APP_KEY", n.SMSAppKey)
+	n.SMSAppSecret = envStr("ZINIAO_SMS_APP_SECRET", n.SMSAppSecret)
+	n.SMSSignName = envStr("ZINIAO_SMS_SIGN_NAME", n.SMSSignName)
+	n.SMSTemplateCode = envStr("ZINIAO_SMS_TEMPLATE_CODE", n.SMSTemplateCode)
+	n.SMSTemplateKey = envStr("ZINIAO_SMS_TEMPLATE_KEY", n.SMSTemplateKey)
+	n.SMSTimeout = envDur("ZINIAO_SMS_TIMEOUT", n.SMSTimeout)
+	n.SMSMaxRetry = envInt("ZINIAO_SMS_MAX_RETRY", n.SMSMaxRetry)
+	n.SMSAllowLoopback = envBool("ZINIAO_SMS_ALLOW_LOOPBACK", n.SMSAllowLoopback)
 	n.MaxAttempts = envInt("ZINIAO_NOTIFY_MAX_ATTEMPTS", n.MaxAttempts)
 	n.MinRisk = envStr("ZINIAO_NOTIFY_MIN_RISK", n.MinRisk)
+	// M2 收尾 / T12：拨测出网开关与目标地址（默认值见 Default()）。
+	c.ProxyTestEnabled = envOnOff("ZINIAO_PROXY_TEST", c.ProxyTestEnabled)
+	c.ProxyTestTarget = envStr("ZINIAO_PROXY_TEST_TARGET", c.ProxyTestTarget)
+	c.ProxyTestCountryTarget = envStr("ZINIAO_PROXY_TEST_COUNTRY", c.ProxyTestCountryTarget)
 	return c
+}
+
+// envOnOff 解析 on/off 型开关（兼容 1/0、true/false、yes/no、enabled/disabled）。
+// 不用 envBool：strconv.ParseBool 不认 "on"/"off"，运维写了 off 会被当成解析失败
+// 悄悄回落默认 on——出网开关绝不能这样静默失效。
+func envOnOff(k string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(k))) {
+	case "on", "1", "true", "yes", "enabled":
+		return true
+	case "off", "0", "false", "no", "disabled":
+		return false
+	}
+	return def
 }
 
 // NotifyChannels 当前配置下**真正可用**的外发通道（顺序固定，便于断言与展示）。
@@ -236,6 +345,11 @@ func (c Config) NotifyChannels() []string {
 	}
 	if n := c.Notify; n.WebhookURL != "" {
 		out = append(out, "webhook")
+	}
+	// 短信要 AppKey 与模板 CODE 都在才算装配：只有其中一个时 BuildSenders 会直接
+	// 报错（半配置必须在启动阶段暴露），这里因此不把它算作可用通道。
+	if n := c.Notify; n.SMSAppKey != "" && n.SMSTemplateCode != "" {
+		out = append(out, "sms")
 	}
 	return out
 }

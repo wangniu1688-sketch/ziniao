@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default-capabilities",
+  "description": "主控页与环境窗口工具条的 IPC 能力：此前全工程没有任何 capability 文件（IPC 全量拒绝，探针原型因此只能用 document.title 回传）；工具条要用 invoke(env_nav) 驱动地址栏，必须显式放行 core 命令（应用自定义命令默认放行）。网页 webview（env-*-page，指向外部站点）刻意不授予任何能力。",
+  "windows": ["main", "env-*"],
+  "webviews": ["main", "env-*-bar"],
+  "permissions": ["core:default"]
+}

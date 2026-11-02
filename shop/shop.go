@@ -114,7 +114,8 @@ func (s *Service) List(ctx context.Context, actor iam.Subject, path string, limi
 	tctx := store.WithTenant(ctx, actor.TenantID)
 	shops, total, err := s.st.Shops().List(tctx, store.ShopFilter{
 		OwnerID: actor.UserID, Scope: decision.DataScope,
-		Limit: limit, Offset: offset,
+		DelegatedFor: actor.UserID, // own 范围下放行「委托给我的店铺」（代理机构委托）
+		Limit:        limit, Offset: offset,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -137,8 +138,8 @@ func (s *Service) Get(ctx context.Context, actor iam.Subject, id, path string) (
 	if err != nil {
 		return nil, err
 	}
-	if decision.DataScope == "own" && sp.OwnerID != actor.UserID {
-		return nil, apierr.Forbidden("无权查看该店铺（数据级权限）")
+	if err := checkShopAccess(s.st, tctx, decision, actor, sp, "查看该店铺"); err != nil {
+		return nil, err
 	}
 	v := toView(*sp, decision.MaskFields)
 	return &v, nil
@@ -161,6 +162,9 @@ func (s *Service) Delete(ctx context.Context, actor iam.Subject, id, path string
 	now := time.Now().UTC()
 	sp.DeletedAt = &now
 	sp.UpdatedAt = now
+	if err := checkShopAccess(s.st, tctx, decision, actor, sp, "删除他人店铺"); err != nil {
+		return err
+	}
 	return s.st.WithTx(tctx, func(tx store.Tx) error {
 		if err := tx.Shops().Update(tctx, sp); err != nil {
 			return err

@@ -27,7 +27,14 @@ func (s *Sink) Name() string { return "audit" }
 func (s *Sink) Types() []string { return nil }
 
 // Handle 落一条审计记录（哈希链在事务内计算，保证 per-tenant 顺序一致）。
+//
+// 接收侧投递幂等：消费登记与审计写入在**同一事务**内提交。审计条目的主键就是
+// event.ID——没有这个原子登记，重投会在 Append 处撞主键，事件卡在 pending
+// 直到重试耗尽，期间同租户哈希链也无法继续。
 func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
+	if consumed, err := s.st.Outbox().Consumed(ctx, ev.ID, s.Name()); err == nil && consumed {
+		return nil // 重复投递（直接调用或重投）：审计只留一份
+	}
 	var data json.RawMessage
 	if ev.Data != nil {
 		b, err := json.Marshal(ev.Data)
@@ -53,6 +60,9 @@ func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 		Data:        data,
 	}
 	return s.st.WithTx(ctx, func(tx store.Tx) error {
+		if err := tx.Outbox().MarkConsumed(ctx, ev.ID, s.Name()); err != nil {
+			return err
+		}
 		return tx.Audit().Append(ctx, entry)
 	})
 }

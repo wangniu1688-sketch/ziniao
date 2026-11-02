@@ -45,3 +45,80 @@ func (j *EgressJanitor) Run(ctx context.Context, jc Context) []Result {
 	}
 	return out
 }
+
+// DeviceRetirer 依赖：到期设备的出口归还与状态回收。
+type DeviceRetirer interface {
+	RetireExpired(ctx context.Context, tenantID string, now time.Time) (int, error)
+}
+
+// DeviceRetireJanitor 到期设备回收任务。
+//
+// 与 EgressJanitor 分开注册的理由：两者扫的是不同生命周期——
+// 出口绑定按租约到期（小时级），设备按月租到期（天级）。
+// 合在一起只会让「这次到底回收了什么」说不清，频率也没法分别调。
+type DeviceRetireJanitor struct {
+	retirer DeviceRetirer
+}
+
+// NewDeviceRetireJanitor 构造到期设备回收任务。
+func NewDeviceRetireJanitor(r DeviceRetirer) *DeviceRetireJanitor {
+	return &DeviceRetireJanitor{retirer: r}
+}
+
+func (j *DeviceRetireJanitor) Name() string            { return "device.retire_expired" }
+func (j *DeviceRetireJanitor) Interval() time.Duration { return 6 * time.Hour }
+
+func (j *DeviceRetireJanitor) Run(ctx context.Context, jc Context) []Result {
+	out := []Result{}
+	for _, t := range jc.Tenants {
+		n, err := j.retirer.RetireExpired(ctx, t.ID, jc.Now)
+		if err != nil {
+			out = append(out, Result{Job: j.Name(), TenantID: t.ID, Err: err.Error()})
+			continue
+		}
+		out = append(out, Result{Job: j.Name(), TenantID: t.ID, Affected: n,
+			Note: "到期设备已停用并归还出口"})
+	}
+	return out
+}
+
+// EgressHistoryPruner 依赖：出口绑定历史的保留期裁剪。
+type EgressHistoryPruner interface {
+	PruneEvents(ctx context.Context, tenantID string, before time.Time) (int64, error)
+}
+
+// EgressHistoryPruneJob 出口绑定历史保留期裁剪任务。
+//
+// 历史只追加不改写，不裁剪就会无限增长；但裁剪是运营决策（保留多久），
+// 不该硬编码在业务里——retentionDays <= 0 时本任务什么都不做（历史是资产，
+// 共用 ASN 的证据链怕断不怕长，想永远留着就把天数配成 0）。
+type EgressHistoryPruneJob struct {
+	pruner        EgressHistoryPruner
+	retentionDays int
+}
+
+// NewEgressHistoryPruneJob 构造裁剪任务。
+func NewEgressHistoryPruneJob(p EgressHistoryPruner, retentionDays int) *EgressHistoryPruneJob {
+	return &EgressHistoryPruneJob{pruner: p, retentionDays: retentionDays}
+}
+
+func (j *EgressHistoryPruneJob) Name() string            { return "network.egress_history_prune" }
+func (j *EgressHistoryPruneJob) Interval() time.Duration { return 24 * time.Hour }
+
+func (j *EgressHistoryPruneJob) Run(ctx context.Context, jc Context) []Result {
+	if j.retentionDays <= 0 {
+		return []Result{{Job: j.Name(), Note: "保留期未启用（<=0），不裁剪"}}
+	}
+	cutoff := jc.Now.AddDate(0, 0, -j.retentionDays)
+	out := []Result{}
+	for _, t := range jc.Tenants {
+		n, err := j.pruner.PruneEvents(ctx, t.ID, cutoff)
+		if err != nil {
+			out = append(out, Result{Job: j.Name(), TenantID: t.ID, Err: err.Error()})
+			continue
+		}
+		out = append(out, Result{Job: j.Name(), TenantID: t.ID, Affected: int(n),
+			Note: "已裁剪保留期外的出口绑定历史"})
+	}
+	return out
+}

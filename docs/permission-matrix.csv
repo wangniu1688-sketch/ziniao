@@ -1,26 +1,51 @@
-permission_key,layer,group,risk,owner,ops_manager,operator,cs,finance,备注
-shop:create,function,店铺,medium,Y,Y,Y,N,N,新建店铺
-shop:read,function,店铺,low,Y,Y,Y,Y,Y,查看店铺
-shop:update,function,店铺,medium,Y,Y,Y,N,N,修改店铺
-shop:delete,function,店铺,high,Y,Y,N,N,N,删除/回收店铺
-member:invite,function,团队,medium,Y,Y,N,N,N,邀请/添加成员
-member:list,function,团队,low,Y,Y,N,N,N,查看成员列表
-role:grant,function,团队,high,Y,N,N,N,N,授予角色（管理变动类→权限日志）
-role:manage,function,团队,high,Y,N,N,N,N,角色与权限管理
-audit:read,function,安全,medium,Y,Y,N,N,N,查看审计日志
-audit:export,function,安全,high,Y,N,N,N,N,导出需二次审批（obligation=require_approval）
-finance:read,function,财务,high,Y,N,N,N,Y,财务角色可见但字段被遮蔽
-page:shops,page,店铺,,Y,Y,Y,Y,Y,店铺列表页
-page:finance,page,财务,,Y,N,N,N,Y,财务管理页
-page:audit,page,安全,,Y,Y,N,N,N,审计日志页
-page:team,page,团队,,Y,Y,N,N,N,团队管理页
-element:shop.delete_button,element,店铺,,Y,Y,N,N,N,DOM 选择器 [data-el="shop.delete_button"]
-element:shop.export_button,element,店铺,,Y,Y,N,N,N,DOM 选择器 [data-el="shop.export_button"]
-element:finance.export_button,element,财务,,Y,N,N,N,N,财务角色亦被屏蔽（防导出明文）
-element:finance.profit_field,element,财务,,Y,N,N,N,N,利润字段元素级屏蔽
-data:shop,data,店铺,,all,all,own,own,all,数据范围决定可见行
-resource:device.purchase,resource,设备,,Y,Y,N,N,N,购买云网络设备
-resource:box.purchase,resource,设备,,Y,N,N,N,N,紫鸟盒子购买权（官方资源级权限实例）
-mask:profit,obligation,财务,,-,-,-,-,Y,利润字段替换为 ***
-mask:cost,obligation,财务,,-,-,-,-,Y,成本字段替换为 ***
-mask:balance,obligation,财务,,-,-,-,-,Y,收款余额字段替换为 ***
+permission_key,layer,group,risk,owner,ops_manager,operator,cs,agency_ops,finance,备注
+shop:create,function,店铺,medium,Y,Y,Y,N,N,N,新建店铺
+shop:read,function,店铺,low,Y,Y,Y,Y,Y,Y,查看店铺
+shop:update,function,店铺,medium,Y,Y,Y,N,N,N,修改店铺
+shop:delete,function,店铺,high,Y,Y,N,N,N,N,删除/回收店铺
+member:invite,function,团队,medium,Y,Y,N,N,N,N,邀请/添加成员
+member:list,function,团队,low,Y,Y,N,N,N,N,查看成员列表
+role:grant,function,团队,high,Y,N,N,N,N,N,授予角色（管理变动类→权限日志）
+role:manage,function,团队,high,Y,N,N,N,N,N,角色与权限管理
+audit:read,function,安全,medium,Y,Y,N,N,N,N,查看审计日志
+audit:export,function,安全,high,Y,N,N,N,N,N,导出需二次审批（obligation=require_approval）
+finance:read,function,财务,high,Y,N,N,N,N,Y,财务角色可见但字段被遮蔽
+shop:credential.manage,function,店铺,high,Y,Y,N,N,N,N,维护店铺托管凭证
+shop:credential.reveal,function,店铺,high,Y,Y,N,N,N,N,查看凭证明文（obligation=require_approval）
+shop:transition,function,店铺,medium,Y,Y,Y,N,N,N,变更店铺生命周期状态
+env:create,function,环境,medium,Y,Y,Y,N,N,N,创建店铺浏览器环境
+env:check,function,环境,low,Y,Y,Y,N,Y,N,运行环境自检
+env:launch,function,环境,medium,Y,Y,Y,N,Y,N,启动店铺浏览器环境（M3 隔离窗口）
+env:stop,function,环境,low,Y,Y,Y,N,Y,N,关闭店铺浏览器环境
+env:deactivate,function,环境,high,Y,Y,N,N,N,N,停用/启用店铺环境（释放出口绑定）
+env:delete,function,环境,high,Y,Y,N,N,N,N,删除店铺环境（不可逆）
+env:read,function,环境,low,Y,Y,Y,Y,Y,N,环境聚合列表与详情（M2 新增）
+env:update,function,环境,medium,Y,Y,Y,N,N,N,改环境配置（绑定代理/改分组）（M2 新增）
+egress:read,function,出口,low,Y,Y,N,N,N,N,查看出口代理商路由表
+group:read,function,店铺,low,Y,Y,Y,Y,Y,N,查看店铺分组（M2 新增）
+group:manage,function,店铺,medium,Y,Y,N,N,N,N,分组增删改（M2 新增）
+proxy:read,function,网络,low,Y,Y,Y,N,N,N,查看手工代理台账（不含口令）（M2 新增）
+proxy:manage,function,网络,high,Y,Y,N,N,N,N,代理增删改与连通性拨测（M2 新增）
+ca:manage,function,安全,high,Y,Y,N,N,N,N,安装/卸载本机 MITM 根证书（当前用户信任库，M3 新增）
+page:shops,page,店铺,,Y,Y,Y,Y,Y,Y,店铺列表页
+page:finance,page,财务,,Y,N,N,N,N,Y,财务管理页
+page:audit,page,安全,,Y,Y,N,N,N,N,审计日志页
+page:team,page,团队,,Y,Y,N,N,N,N,团队管理页
+page:devices,page,设备,,Y,Y,Y,N,N,N,设备列表页
+page:security,page,安全,,Y,Y,N,N,N,N,安全中心页
+page:approvals,page,审批,,Y,Y,Y,N,N,N,审批工单页
+page:groups,page,店铺,,Y,Y,Y,Y,N,N,分组管理页（M2 新增）
+page:proxies,page,网络,,Y,Y,Y,N,N,N,代理台账页（M2 新增）
+page:logs,page,安全,,Y,Y,Y,N,N,N,日志中心页（M2 新增）
+page:environments,page,环境,,Y,Y,Y,N,N,N,环境页（随 M2 登记补齐；前端无独立入口，环境视图在店铺页内）
+element:shop.delete_button,element,店铺,,Y,Y,N,N,N,N,DOM 选择器 [data-el="shop.delete_button"]
+element:shop.export_button,element,店铺,,Y,Y,N,N,N,N,DOM 选择器 [data-el="shop.export_button"]
+element:finance.export_button,element,财务,,Y,N,N,N,N,N,财务角色亦被屏蔽（防导出明文）
+element:finance.profit_field,element,财务,,Y,N,N,N,N,N,利润字段元素级屏蔽
+data:shop,data,店铺,,all,all,own,own,own,all,数据范围决定可见行
+data:device,data,设备,,all,all,own,none,none,none,设备数据范围
+resource:device.purchase,resource,设备,,Y,Y,N,N,N,N,购买云网络设备
+resource:box.purchase,resource,设备,,Y,N,N,N,N,N,紫鸟盒子购买权（官方资源级权限实例）
+mask:profit,obligation,财务,,-,-,-,-,-,Y,利润字段替换为 ***
+mask:cost,obligation,财务,,-,-,-,-,-,Y,成本字段替换为 ***
+mask:balance,obligation,财务,,-,-,-,-,-,Y,收款余额字段替换为 ***

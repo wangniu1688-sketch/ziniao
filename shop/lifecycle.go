@@ -89,8 +89,8 @@ func (s *Service) Transition(ctx context.Context, in TransitionInput) (*types.Sh
 	if err != nil {
 		return nil, err
 	}
-	if d.DataScope == "own" && sh.OwnerID != in.Actor.UserID {
-		return nil, apierr.Forbidden("无权操作他人店铺")
+	if err := checkShopAccess(s.st, tctx, d, in.Actor, sh, "操作他人店铺"); err != nil {
+		return nil, err
 	}
 	if err := CanTransition(sh.Status, in.To); err != nil {
 		return nil, err
@@ -139,11 +139,31 @@ func (s *Service) SetGroup(ctx context.Context, in SetGroupInput) (*types.Shop, 
 	if err != nil {
 		return nil, err
 	}
-	if d.DataScope == "own" && sh.OwnerID != in.Actor.UserID {
-		return nil, apierr.Forbidden("无权操作他人店铺")
+	if err := checkShopAccess(s.st, tctx, d, in.Actor, sh, "操作他人店铺"); err != nil {
+		return nil, err
+	}
+	// 双写兼容（M2 补查）：group_name 是历史文本列，group_id 是 0012 起的外键，
+	// 读路径以 group_id 为准。只改 group_name 会让店铺卡片显示新组名、分组筛选
+	// 却仍按旧 group_id 命中，所以两列必须在同一次 Update 里一起写。
+	// 旧的自由文本分组名若还没有同名分组记录，group_id 置空（视为未分组），
+	// 绝不留下「文本指向 B、外键还指向 A」的半行。
+	groupName := in.Group
+	groupID := ""
+	if groupName != "" {
+		groups, lerr := s.st.Groups().List(tctx)
+		if lerr != nil {
+			return nil, lerr
+		}
+		for _, g := range groups {
+			if g.Name == groupName {
+				groupID = g.ID
+				break
+			}
+		}
 	}
 	now := time.Now().UTC()
-	sh.Group = in.Group
+	sh.Group = groupName
+	sh.GroupID = groupID
 	sh.Tags = in.Tags
 	sh.UpdatedAt = now
 	if err := s.st.WithTx(tctx, func(tx store.Tx) error {
@@ -155,7 +175,7 @@ func (s *Service) SetGroup(ctx context.Context, in SetGroupInput) (*types.Shop, 
 			Actor: actorOf(in.Actor), Subject: eventbus.Subject{ShopID: in.ShopID},
 			Terminal: in.Terminal,
 			Context:  eventbus.ContextInfo{URL: in.URL, Action: "shop.group", Result: "success"},
-			Data:     map[string]any{"group": in.Group, "tags": in.Tags},
+			Data:     map[string]any{"group": groupName, "group_id": groupID, "tags": in.Tags},
 		})
 	}); err != nil {
 		return nil, err
@@ -172,6 +192,9 @@ func (s *Service) Restore(ctx context.Context, shopID string, actor iam.Subject,
 	tctx := store.WithTenant(ctx, actor.TenantID)
 	sh, err := s.st.Shops().Get(tctx, shopID)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkShopAccess(s.st, tctx, d, actor, sh, "恢复他人店铺"); err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()

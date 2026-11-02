@@ -17,11 +17,18 @@ import (
 const testPassword = "Zn@12345678"
 
 // newTestApp 用内存驱动装配应用（与生产同一条装配路径）。
-func newTestApp(t *testing.T) *app.App {
+// opts 在装配前改写配置：部署级开关（如拨测总开关）需要在 Server 构造时生效。
+func newTestApp(t *testing.T, opts ...func(*config.Config)) *app.App {
 	t.Helper()
 	cfg := config.Default()
 	cfg.StoreDriver = "memory"
 	cfg.JWTSecret = "test-secret"
+	// 数据目录指到临时目录：否则每个用到它的测试都会在包目录下建一个 ./data，
+	// 而「测试之间共享同一个数据目录」会让注册表/锁互相干扰（真正的多实例场景）。
+	cfg.DataDir = t.TempDir()
+	for _, o := range opts {
+		o(cfg)
+	}
 	a, err := app.New(context.Background(), cfg, mem.New(), nil)
 	if err != nil {
 		t.Fatalf("装配失败: %v", err)
@@ -29,9 +36,9 @@ func newTestApp(t *testing.T) *app.App {
 	return a
 }
 
-func newTestServer(t *testing.T) (*app.App, *httptest.Server) {
+func newTestServer(t *testing.T, opts ...func(*config.Config)) (*app.App, *httptest.Server) {
 	t.Helper()
-	a := newTestApp(t)
+	a := newTestApp(t, opts...)
 	srv := httptest.NewServer(a.Handler)
 	t.Cleanup(srv.Close)
 	return a, srv

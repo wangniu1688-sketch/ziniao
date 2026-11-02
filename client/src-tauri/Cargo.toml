@@ -13,7 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# unstable：多 webview（Window::add_child / Window::builder）目前只在 unstable feature 下提供，
+# 而「浏览器壳 = 空窗口 + 顶部工具条 webview + 网页 webview」只有这条路能走得通
+# （网页若用窗口自带的 webview，工具条就无处可放）。代价记在文档里：实验性 API，随版本可能变。
+tauri = { version = "2", features = ["unstable"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 本地前置代理由 Go 侧 ziniao-proxy 提供（保证 TLS 指纹与内核基线同源）。

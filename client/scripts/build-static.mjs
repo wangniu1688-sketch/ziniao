@@ -22,6 +22,12 @@ mkdirSync(dist, { recursive: true });
 // dist/index.html 自带内联脚本（无外部依赖），直接复制即可
 copyFileSync(join(root, "index.html"), join(dist, "index.html"));
 
+// 多 webview 原型探针页（探路用：验证子 webview 的 UA/注入脚本/profile 目录）
+copyFileSync(join(root, "probe.html"), join(dist, "probe.html"));
+
+// 环境窗口浏览器壳的工具条页（后退/前进/刷新/地址栏 + 环境信息条）
+copyFileSync(join(root, "browser.html"), join(dist, "browser.html"));
+
 // 前端 IPC：把 @tauri-apps/api 的原样 ESM 文件搬进 dist/api
 const apiSrc = join(root, "node_modules", "@tauri-apps", "api");
 const apiDst = join(dist, "api");

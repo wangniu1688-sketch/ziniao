@@ -30,7 +30,9 @@ type Meter struct {
 // NewMeter 构造计量器。
 func NewMeter(st store.Store) *Meter { return &Meter{st: st} }
 
-// Record 增加计量值，返回最新累计值。
+// Record 增加计量值，返回最新累计值。delta 允许为负（设备删除回退 device_count），
+// 但调用方必须在写入前自己钳住下限（见 device.Service.Delete：查到 0 就跳过），
+// 避免计量与台账不同步时减成负数、让后续申购凭空多出额度。
 func (m *Meter) Record(ctx context.Context, tx store.Tx, tenantID, metric string, delta int64) (int64, error) {
 	if tenantID == "" {
 		tid, err := store.TenantFrom(ctx)

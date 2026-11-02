@@ -26,6 +26,15 @@ var templates = map[string]Template{
 	"iam.approval.expired":  {"审批结果：已过期", "审批单超时未处理，已自动失效"},
 	"iam.approval.used":     {"高危提示：审批单已核销", "审批单已被用于高危操作"},
 
+	// 代理机构委托审批（approval_flows）：待办定向委托方审批人，
+	// 结果定向受托方申请人（事件 Data.approver_ids 由 delegation 服务算好）。
+	"iam.delegation.created":   {"待办：代理机构委托申请", "有代理机构申请代管店铺，请尽快裁决"},
+	"iam.delegation.approved":  {"委托申请已批准", "你提交的代理委托申请已通过，授权已生效"},
+	"iam.delegation.rejected":  {"委托申请被拒绝", "你提交的代理委托申请已被委托方驳回"},
+	"iam.delegation.cancelled": {"委托申请已撤回", "代理委托申请已由申请人撤回"},
+	"iam.delegation.revoked":   {"高危提示：委托已被撤销", "生效中的店铺委托已被委托方撤销，相关授权已回收"},
+	"iam.delegation.expired":   {"委托已到期失效", "委托申请超期未决或委托期已满，相关授权已回收"},
+
 	// 临时授权到期被回收：定向发给当事人。少了这条，用户只会发现
 	// 「某个操作忽然 403 了」，却不知道是自己的临时授权到期。
 	"iam.temp_grant.expired": {"权限到期已回收", "你的临时授权已到期并自动回收，如仍需使用请联系管理员重新授权"},

@@ -82,6 +82,15 @@ func (g grantReaper) RevokeExpired(ctx context.Context, tenantID string, now tim
 	return g.a.Tenant.RevokeExpiredGrants(ctx, tenantID, now)
 }
 
+type delegationSweeper struct{ a *App }
+
+func (d delegationSweeper) ExpireSweep(ctx context.Context, tenantID string, now time.Time) (int, error) {
+	if d.a.Delegations == nil {
+		return 0, nil
+	}
+	return d.a.Delegations.ExpireSweep(ctx, tenantID, now)
+}
+
 type egressSweeper struct{ a *App }
 
 // SweepTenant 清理该租户到期的出口绑定，并向代理商归还资源。
@@ -92,6 +101,23 @@ func (s egressSweeper) SweepTenant(ctx context.Context, tenantID string, now tim
 		return 0, nil
 	}
 	return pool.SweepTenant(ctx, tenantID, now)
+}
+
+type deviceRetirer struct{ a *App }
+
+// RetireExpired 回收该租户到期的设备（归还出口 + 标记过期）。
+func (d deviceRetirer) RetireExpired(ctx context.Context, tenantID string, now time.Time) (int, error) {
+	if d.a.Device == nil {
+		return 0, nil
+	}
+	return d.a.Device.RetireExpired(ctx, tenantID, now)
+}
+
+// egressHistoryPruner 出口绑定历史裁剪（仓储层直接就能做，不需要业务服务）。
+type egressHistoryPruner struct{ a *App }
+
+func (p egressHistoryPruner) PruneEvents(ctx context.Context, tenantID string, before time.Time) (int64, error) {
+	return p.a.Store.EgressBindings().PruneEvents(store.WithTenant(ctx, tenantID), tenantID, before)
 }
 
 type notifyRetryer struct{ a *App }
@@ -106,7 +132,7 @@ func (n notifyRetryer) RetryTenant(ctx context.Context, tenantID string) (int, i
 	return n.a.NotifySink.RetryTenant(ctx, tenantID)
 }
 
-// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收 / 出口绑定回收 / 通知重投）。
+// wireJobs 注册定时任务（设备巡检 / 回收站清理 / 审批单过期 / 临时授权回收 / 出口绑定回收 / 通知重投 / 环境状态回收）。
 func (a *App) wireJobs() {
 	cfg := a.Config
 	sched := jobs.NewScheduler(tenantLister{st: a.Store}, a.Log)
@@ -115,9 +141,23 @@ func (a *App) wireJobs() {
 			cfg.Limits.DeviceExpireWarnDays, cfg.Limits.DeviceHealthMinScore),
 		jobs.NewShopPurger(trashPurger{a: a}, cfg.Limits.ShopTrashRetentionDays),
 		jobs.NewApprovalJanitor(approvalSweeper{a: a}),
+		jobs.NewDelegationJanitor(delegationSweeper{a: a}),
 		jobs.NewTempGrantJanitor(grantReaper{a: a}),
 		jobs.NewEgressJanitor(egressSweeper{a: a}),
+		jobs.NewDeviceRetireJanitor(deviceRetirer{a: a}),
+		jobs.NewEgressHistoryPruneJob(egressHistoryPruner{a: a}, cfg.Limits.EgressHistoryRetentionDays),
 		jobs.NewNotifyJanitor(notifyRetryer{a: a}),
+		jobs.NewEnvJanitor(envReclaimer{a: a}, cfg.Limits.EnvReclaimHours),
 	)
 	a.Jobs = sched
+}
+
+// envReclaimer 环境状态回收（客户端崩溃/断电时没有关闭上报的兜底）。
+type envReclaimer struct{ a *App }
+
+func (e envReclaimer) ReclaimIdle(ctx context.Context, tenantID string, now time.Time, maxAge time.Duration) (int, error) {
+	if e.a.Environments == nil {
+		return 0, nil
+	}
+	return e.a.Environments.ReclaimIdle(ctx, tenantID, now, maxAge)
 }

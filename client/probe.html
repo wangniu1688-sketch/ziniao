@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'" />
+    <title>PROBE 启动中</title>
+    <style>
+      body { font: 13px/1.6 ui-monospace, Consolas, monospace; margin: 0; padding: 8px 10px; }
+      pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">…</pre>
+    <script>
+      // 原型探针：把「子 webview 到底还剩下哪些能力」如实报回 Rust 侧。
+      //
+      // 结果走 document.title 回传（而不是 invoke）：ACL 还没为原型开命令权限，
+      // 用 title 就不需要动 capabilities——原型只回答可行性，不引入配置噪音。
+      (function () {
+        // role 由 Rust 侧的注入脚本写入：**不能**走 URL query——
+        // WebviewUrl::App 的 query 会被当成路径的一部分，页面直接 404
+        // （第一版原型就栽在这里：页面没加载出来、title 却是 localhost，
+        // 差点被当成"验证通过"）。
+        var role = window.__ZINIAO_ROLE__ || '(未注入 role)';
+        var report = {
+          role: role,
+          // 致命项 1：UA 是否还生效（子 webview 自己设的 UA）
+          ua: navigator.userAgent,
+          // 致命项 2：注入脚本是否在文档创建后、页面脚本前执行
+          injected: window.__ZINIAO_PROBE__ || '(未注入)',
+          // 致命项 3：profile 目录（data_directory）是否真的可用且隔离
+          localStorage: (function () {
+            try {
+              localStorage.setItem('probe', 'kept');
+              return localStorage.getItem('probe') || '(读回为空)';
+            } catch (e) {
+              return 'ERR ' + (e && e.message ? e.message : String(e));
+            }
+          })(),
+        };
+        document.getElementById('out').textContent = JSON.stringify(report, null, 2);
+        document.title = 'PROBE:' + JSON.stringify(report);
+      })();
+    </script>
+  </body>
+</html>

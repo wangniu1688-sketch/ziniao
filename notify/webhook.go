@@ -162,6 +162,10 @@ func (w *WebhookSender) sign(body []byte, ts string) string {
 }
 
 // httpError 带状态码的投递错误。
+//
+// 文案里**不带通道名**：这个错误类型现在由 Webhook 与短信共用，写死 "Webhook" 会让
+// 一条短信失败在日志里显示成 Webhook 失败，排查时直接把人引到错误的通道上。
+// 通道名由调用方（Sink.dispatch）自己拼进日志上下文。
 type httpError struct {
 	status int
 	body   string
@@ -169,9 +173,9 @@ type httpError struct {
 
 func (e *httpError) Error() string {
 	if e.body == "" {
-		return fmt.Sprintf("notify: Webhook 返回 HTTP %d", e.status)
+		return fmt.Sprintf("notify: 目标返回 HTTP %d", e.status)
 	}
-	return fmt.Sprintf("notify: Webhook 返回 HTTP %d: %s", e.status, truncate(e.body, 200))
+	return fmt.Sprintf("notify: 目标返回 HTTP %d: %s", e.status, truncate(e.body, 200))
 }
 
 func (e *httpError) Status() int { return e.status }
@@ -186,6 +190,12 @@ func retryable(err error) bool {
 	var he *httpError
 	if errors.As(err, &he) {
 		return he.status == 429 || he.status >= 500
+	}
+	// 短信网关 200 里的业务失败：只有限流会随时间好转，
+	// 模板/签名/余额这类错误再试也是同一个结果（还多扣一次费）。
+	var be *smsBizError
+	if errors.As(err, &be) {
+		return be.throttle
 	}
 	return true
 }

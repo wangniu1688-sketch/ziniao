@@ -252,12 +252,27 @@ func (p *TLSProxy) DialTLS(ctx context.Context, addr string) (net.Conn, error) {
 }
 
 // Serve 启动本地前置代理：CONNECT 走 uTLS 隧道，/healthz 供客户端探活与核对指纹。
+//
+// 只是 ServeListener 的薄封装（内部 Listen 后转交），cmd/ziniao-proxy 行为不变。
 func (p *TLSProxy) Serve(ctx context.Context, listen string) error {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = ln.Close() }()
+	return p.ServeListener(ctx, ln)
+}
+
+// ServeListener 在**已绑定**的 listener 上启动代理（M1：本地代理端口零竞态）。
+//
+// 为什么需要这个变体：启动器要给每个环境起一个本地代理，端口必须是「先拿到
+// listener、再把 listener 交给代理」——如果沿用 Serve(addr)（先 Listen 再交给
+// 调用方去猜端口），「释放监听 → 重新绑定」之间就是一个可被别的进程抢走的窗口。
+// 与 CDP 的 --remote-debugging-port=0 同一个道理：端口只能由 OS 分配一次。
+//
+// listener 的生命周期归调用方：ServeListener 内部不 Close 它（ctx 取消只关
+// http.Server），启动失败时的端口释放由 BrowserManager 的回滚矩阵负责，
+// 避免出现「Serve 已关、端口仍被占」的半死状态。
+func (p *TLSProxy) ServeListener(ctx context.Context, ln net.Listener) error {
 	// 注意：不能用 http.ServeMux——它会把 CONNECT 请求当成「需要补齐路径的
 	// 普通请求」并返回 301 Location:/（host:port 被当作 path），隧道永远建不起来。
 	// 必须自己在单一 handler 里按方法分流。

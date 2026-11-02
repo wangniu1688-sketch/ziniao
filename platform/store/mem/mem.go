@@ -48,9 +48,27 @@ type Store struct {
 
 	// Phase 2：审批工单
 	approvals map[string]*types.ApprovalTicket
+	// Phase 2：审批路由规则（租户可配；空 = 全走内置规则）
+	routeRules map[string]*types.ApprovalRouteRule
+
+	// Phase 2：代理机构委托审批（approval_flows）
+	delegations map[string]*types.DelegationFlow
 
 	// Phase 2B：出口绑定（env_id -> 绑定）
 	egress map[string]*types.EgressBinding
+	// Phase 2C：出口绑定历史（只追加；当前绑定被覆盖后历史仍在）
+	egressHist []*types.EgressBindingEvent
+
+	// Phase 2C：每人通知偏好（(tenant_id, user_id) -> 偏好；行不存在 = 未设置）
+	prefs map[string]*types.NotificationPrefs
+
+	// Phase 2D：事件消费幂等（event_id|handler -> 已消费）。
+	// 口径与 PG 的 event_consumptions 表一致：主键 (event_id, handler)。
+	consumed map[string]bool
+
+	// M1 启动器内核（0012）：手工静态代理台账 + 店铺分组
+	proxies map[string]*types.Proxy
+	groups  map[string]*types.Group
 }
 
 // New 创建空存储。
@@ -65,7 +83,13 @@ func New() *Store {
 		devices: map[string]*types.Device{}, envs: map[string]*types.Environment{},
 		envByShop: map[string]string{}, policies: map[string]*types.AccessPolicy{},
 		vault: map[string]*types.ShopCredential{}, approvals: map[string]*types.ApprovalTicket{},
-		egress: map[string]*types.EgressBinding{},
+		routeRules:  map[string]*types.ApprovalRouteRule{},
+		delegations: map[string]*types.DelegationFlow{},
+		egress:      map[string]*types.EgressBinding{},
+		prefs:       map[string]*types.NotificationPrefs{},
+		consumed:    map[string]bool{},
+		proxies:     map[string]*types.Proxy{},
+		groups:      map[string]*types.Group{},
 	}
 }
 
@@ -101,7 +125,13 @@ func (s *Store) Policies() store.AccessPolicyRepo        { return policyRepo{s} 
 func (s *Store) SecurityEvents() store.SecurityEventRepo { return secEventRepo{s} }
 func (s *Store) Vault() store.VaultRepo                  { return vaultRepo{s} }
 func (s *Store) Approvals() store.ApprovalRepo           { return approvalRepo{s} }
+func (s *Store) Delegations() store.DelegationRepo       { return delegationRepo{s} }
 func (s *Store) EgressBindings() store.EgressBindingRepo { return egressRepo{s} }
+func (s *Store) ApprovalRouteRules() store.ApprovalRouteRuleRepo {
+	return routeRuleRepo{s}
+}
+func (s *Store) Proxies() store.ProxyRepo { return proxyRepo{s} }
+func (s *Store) Groups() store.GroupRepo  { return groupRepo{s} }
 
 // ---------- 租户 ----------
 
@@ -286,8 +316,22 @@ func (r roleRepo) Get(_ context.Context, id string) (*types.Role, error) {
 }
 
 func (r roleRepo) GetByCode(_ context.Context, tenantID, code string) (*types.Role, error) {
-	for _, role := range r.s.roles {
-		if role.Code == code && (role.TenantID == tenantID || role.TenantID == "") {
+	// 命中顺序与 PG 实现一致：先租户自定义角色，再系统内置角色（tenant_id 为空）。
+	// 原来写成一次遍历 + `|| role.TenantID == ""`，命中与否取决于 map 迭代顺序 ⇒
+	// 同一个测试反复跑会一会儿拿到自定义角色、一会儿拿到系统角色（随机失败），
+	// 而 PG 侧永远先命中租户角色——测试替身与真实依赖语义不一致，在这里修掉。
+	for _, pass := range []int{0, 1} {
+		for _, role := range r.s.roles {
+			systemWide := role.TenantID == ""
+			if pass == 0 && systemWide {
+				continue // 第一趟只要本租户的
+			}
+			if pass == 1 && !systemWide {
+				continue // 第二趟只要系统级的
+			}
+			if role.Code != code {
+				continue
+			}
 			cp := *role
 			cp.Permissions = append([]string(nil), role.Permissions...)
 			return &cp, nil
@@ -316,6 +360,28 @@ func (r roleRepo) SetPermissions(_ context.Context, id string, perms []string) e
 	}
 	role.Permissions = append([]string(nil), perms...)
 	return nil
+}
+
+// AddPermissions 并集补齐（已有的不动，返回新增条数）。
+func (r roleRepo) AddPermissions(_ context.Context, id string, perms []string) (int, error) {
+	role, ok := r.s.roles[id]
+	if !ok {
+		return 0, notFound("role", id)
+	}
+	have := make(map[string]bool, len(role.Permissions))
+	for _, p := range role.Permissions {
+		have[p] = true
+	}
+	added := 0
+	for _, p := range perms {
+		if p == "" || have[p] {
+			continue
+		}
+		role.Permissions = append(role.Permissions, p)
+		have[p] = true
+		added++
+	}
+	return added, nil
 }
 
 type userRoleRepo struct{ s *Store }
@@ -382,6 +448,22 @@ func (r grantRepo) ListByUser(_ context.Context, tenantID, userID, resourceType 
 		}
 		out = append(out, *g)
 	}
+	return out, nil
+}
+
+// DeleteByScope 删除该用户在某 scope 下的全部授权并返回副本。
+// 锁的说明见 ListByUser：并发由 WithTx 负责，此处不得加锁。
+func (r grantRepo) DeleteByScope(_ context.Context, tenantID, userID, scope string) ([]types.DataGrant, error) {
+	out := []types.DataGrant{}
+	kept := make([]*types.DataGrant, 0, len(r.s.grants))
+	for _, g := range r.s.grants {
+		if g.TenantID == tenantID && g.UserID == userID && g.Scope == scope {
+			out = append(out, *g)
+			continue
+		}
+		kept = append(kept, g)
+	}
+	r.s.grants = kept
 	return out, nil
 }
 
@@ -477,6 +559,21 @@ func (r shopRepo) List(ctx context.Context, f store.ShopFilter) ([]types.Shop, i
 		return nil, 0, err
 	}
 	out := []types.Shop{}
+	// own 范围下同时放行「委托给 f.DelegatedFor 的店铺」：代理机构委托批准后，
+	// 受托方在委托方团队里也能在列表里看到被托管的店铺（有效期由 DataGrant.ExpiresAt 决定）。
+	granted := map[string]bool{}
+	if f.Scope == "own" && f.DelegatedFor != "" {
+		now := time.Now().UTC()
+		for _, g := range r.s.grants {
+			if g.TenantID != tid || g.UserID != f.DelegatedFor || g.ResourceType != "shop" {
+				continue
+			}
+			if g.ExpiresAt != nil && !g.ExpiresAt.After(now) {
+				continue
+			}
+			granted[g.ResourceID] = true
+		}
+	}
 	for _, shop := range r.s.shops {
 		if shop.TenantID != tid {
 			continue
@@ -488,7 +585,10 @@ func (r shopRepo) List(ctx context.Context, f store.ShopFilter) ([]types.Shop, i
 		} else if !f.IncludeDeleted && shop.DeletedAt != nil {
 			continue
 		}
-		if f.Scope == "own" && shop.OwnerID != f.OwnerID {
+		if f.Scope == "own" && shop.OwnerID != f.OwnerID && !granted[shop.ID] {
+			continue
+		}
+		if f.GroupID != "" && shop.GroupID != f.GroupID {
 			continue
 		}
 		out = append(out, *shop)
@@ -629,6 +729,17 @@ func (r outboxRepo) Fail(_ context.Context, id, errMsg string) error {
 		}
 	}
 	return notFound("outbox", id)
+}
+
+// Consumed 接收侧投递幂等（与 PG 的 event_consumptions 同口径）。
+// 键是 event_id + "|" + handler：event ID 全局唯一（ids.New），handler 名包内唯一。
+func (r outboxRepo) Consumed(_ context.Context, eventID, handler string) (bool, error) {
+	return r.s.consumed[eventID+"|"+handler], nil
+}
+
+func (r outboxRepo) MarkConsumed(_ context.Context, eventID, handler string) error {
+	r.s.consumed[eventID+"|"+handler] = true
+	return nil
 }
 
 // ---------- 审计 ----------
@@ -776,6 +887,40 @@ func (r notifRepo) UpdateDelivery(_ context.Context, n *types.Notification) erro
 		}
 	}
 	return notFound("notification", n.ID)
+}
+
+// CountUnread 未读条数（与 pg 同口径：read_at 为空即未读）。
+func (r notifRepo) CountUnread(_ context.Context, tenantID, userID string) (int, error) {
+	n := 0
+	for _, it := range r.s.notifs {
+		if it.TenantID == tenantID && it.UserID == userID && it.ReadAt == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// GetPrefs 取通知偏好。无行返回 (nil, nil)，语义是「未设置」（与 pg 严格对齐：
+// 上层据此走默认，不能把它当错误处理）。返回副本，调用方改无限。
+func (r notifRepo) GetPrefs(_ context.Context, tenantID, userID string) (*types.NotificationPrefs, error) {
+	p, ok := r.s.prefs[prefKey(tenantID, userID)]
+	if !ok {
+		return nil, nil
+	}
+	cp := *p
+	cp.Channels = append([]string{}, p.Channels...)
+	return &cp, nil
+}
+
+func prefKey(tenantID, userID string) string { return tenantID + "|" + userID }
+
+func (r notifRepo) SetPrefs(_ context.Context, p *types.NotificationPrefs) error {
+	cp := *p
+	cp.Channels = append([]string{}, p.Channels...)
+	now := time.Now()
+	cp.UpdatedAt = now
+	r.s.prefs[prefKey(p.TenantID, p.UserID)] = &cp
+	return nil
 }
 
 // ListPendingDelivery 与 pg 同源语义：只认 pending/failed，升序，limit<=0 取 100。

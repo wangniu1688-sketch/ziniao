@@ -12,6 +12,8 @@ import (
 	"ziniao/approval"
 	"ziniao/audit"
 	"ziniao/billing"
+	"ziniao/browser"
+	"ziniao/delegation"
 	"ziniao/device"
 	"ziniao/eventbus"
 	"ziniao/fingerprint"
@@ -55,6 +57,23 @@ type Deps struct {
 	Approvals *approval.Service
 	Jobs      *jobs.Scheduler
 
+	// Phase 2：代理机构委托审批（approval_flows）
+	Delegations *delegation.Service
+
+	// Phase 2C：通知 Sink（外发偏好需要它：偏好的读取与校验都在这里，
+	// 网关只负责搬运自助数据，不重复实现一遍通道规则）
+	NotifySink *notify.Sink
+
+	// M1：启动器内核（本机浏览器进程编排 + 运行时注册表 + CA 就绪状态）。
+	// 为 nil 时 /api/v1/system/info 的 browser 段如实给出 installed=false。
+	Browser *browser.Manager
+
+	// M2 启动器内核（业务侧）：手工代理台账与店铺分组。
+	// 放在 Deps 里而不是由网关自己拼仓储：代理口令的加解密只在 ProxyService 里发生，
+	// 网关层永远拿不到明文。
+	Proxies *shop.ProxyService
+	Groups  *shop.GroupService
+
 	// DemoSite 是否挂载账号隔离实测站点 /demo/*（cfg.DemoSite 控制，生产必须为 false）
 	DemoSite bool
 }
@@ -66,6 +85,9 @@ type Server struct {
 	log   *slog.Logger
 	lim   *rateLimiter
 	demoS *DemoStore
+	// startedAt 进程启动时刻（uptime_sec 用；它是「本机启动器跑了多久」，
+	// 不是业务指标，因此不需要落库）。
+	startedAt time.Time
 }
 
 // New 构造网关并注册全部路由。
@@ -73,7 +95,11 @@ func New(d Deps) *Server {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	s := &Server{deps: d, mux: http.NewServeMux(), log: d.Log, lim: newRateLimiter(d.Config.Limits.APIRatePerMinute), demoS: newDemoStore()}
+	s := &Server{
+		deps: d, mux: http.NewServeMux(), log: d.Log,
+		lim: newRateLimiter(d.Config.Limits.APIRatePerMinute), demoS: newDemoStore(),
+		startedAt: time.Now(),
+	}
 	if d.DemoSite {
 		d.Log.Warn("已挂载 demo 隔离实测站点 /demo/*（禁止用于生产环境）")
 		demoRoutes(s.mux, s.demoS)
@@ -120,8 +146,18 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/v1/notifications", s.authed(s.handleNotifyList))
 	m.HandleFunc("POST /api/v1/notifications/{id}/read", s.authed(s.handleNotifyRead))
+	m.HandleFunc("GET /api/v1/notifications/preferences", s.authed(s.handleNotifyPrefsGet))
+	m.HandleFunc("PUT /api/v1/notifications/preferences", s.authed(s.handleNotifyPrefsPut))
 
 	s.routesPhase1()
+	s.routesDelegation()
+	s.routesEgress()
+	s.routesSystem()
+	// M2：代理台账 / 分组 / 环境聚合视图 / 聚合日志
+	s.routesProxies()
+	s.routesGroups()
+	s.routesEnvironments()
+	s.routesLogs()
 }
 
 // ---------- 中间件 ----------
@@ -178,6 +214,28 @@ func (s *Server) authorize(r *http.Request, action, path string) (*identity.Prin
 		return p, subj, d, apierr.Forbidden("无权执行该操作（" + string(d.Layer) + "）")
 	}
 	return p, subj, d, nil
+}
+
+// authorizeAll 多权限码联合裁决：全部通过才放行（如「建环境」既要能建店也要能建环境）。
+// 任一码缺失即 403，拒绝层级沿用第一个被拒的码，便于审计定位。
+func (s *Server) authorizeAll(r *http.Request, path string, actions ...string) (*identity.Principal, iam.Subject, iam.Decision, error) {
+	var last iam.Decision
+	for _, a := range actions {
+		p, subj, d, err := s.authorize(r, a, path)
+		if err != nil {
+			return p, subj, d, err
+		}
+		last = d
+	}
+	p, ok := principalFrom(r.Context())
+	if !ok {
+		return nil, iam.Subject{}, iam.Decision{}, apierr.Unauthorized("未认证")
+	}
+	subj, err := s.deps.Identity.Subject(r.Context(), p)
+	if err != nil {
+		return p, subj, iam.Decision{}, err
+	}
+	return p, subj, last, nil
 }
 
 // terminalFrom 从请求提取终端信息（L5：一条操作要能追到终端与 IP）。

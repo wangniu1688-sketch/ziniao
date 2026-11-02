@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"ziniao/platform/apierr"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 )
@@ -126,6 +127,26 @@ func (r deviceRepo) IncrBound(ctx context.Context, id string, delta int) error {
 	if d.BoundAccounts < 0 {
 		d.BoundAccounts = 0
 	}
+	return nil
+}
+
+// Delete 软删除（写 deleted_at，与 shops 同口径）：台账出清但行保留，
+// 计量回退由服务层在**同一事务**内做，仓储不碰 usage_counters。
+func (r deviceRepo) Delete(ctx context.Context, id string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	d, ok := r.s.devices[id]
+	if !ok || d.TenantID != tid {
+		return notFound("device", id)
+	}
+	if d.DeletedAt != nil {
+		return nil // 幂等：重复删除不假成功也不报错
+	}
+	now := time.Now()
+	d.DeletedAt = &now
+	d.UpdatedAt = now
 	return nil
 }
 
@@ -326,6 +347,122 @@ func (r envRepo) List(ctx context.Context, limit, offset int) ([]types.Environme
 		out = out[:limit]
 	}
 	return out, total, nil
+}
+
+// Search 带过滤的聚合列表（M2 店铺网格页）。与 pg 同口径：已软删店铺的环境不返回。
+func (r envRepo) Search(ctx context.Context, f store.EnvironmentFilter) ([]types.Environment, int, error) {
+	tid, err := store.TenantFrom(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	allowed := map[string]bool{}
+	for _, id := range f.ShopIDs {
+		allowed[id] = true
+	}
+	kw := strings.ToLower(strings.TrimSpace(f.Keyword))
+	out := []types.Environment{}
+	for _, e := range r.s.envs {
+		if e.TenantID != tid {
+			continue
+		}
+		if len(allowed) > 0 && !allowed[e.ShopID] {
+			continue
+		}
+		sh := r.s.shops[e.ShopID]
+		if sh != nil && sh.DeletedAt != nil {
+			continue
+		}
+		if f.GroupID != "" && (sh == nil || sh.GroupID != f.GroupID) {
+			continue
+		}
+		if f.Platform != "" && (sh == nil || sh.Platform != f.Platform) {
+			continue
+		}
+		if f.Status != "" && e.Status != f.Status {
+			continue
+		}
+		if f.Country != "" && e.Country != f.Country {
+			continue
+		}
+		if f.ProxyID != "" && e.ProxyID != f.ProxyID {
+			continue
+		}
+		if kw != "" && !envMatchesKeyword(kw, *e, sh) {
+			continue
+		}
+		out = append(out, *e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	total := len(out)
+	if f.Offset > 0 && f.Offset < len(out) {
+		out = out[f.Offset:]
+	} else if f.Offset >= len(out) {
+		out = nil
+	}
+	if f.Limit > 0 && f.Limit < len(out) {
+		out = out[:f.Limit]
+	}
+	return out, total, nil
+}
+
+// envMatchesKeyword 关键词命中：店铺名 / 自定义编号 / 环境 ID（均大小写不敏感）。
+func envMatchesKeyword(kw string, e types.Environment, sh *types.Shop) bool {
+	if strings.Contains(strings.ToLower(e.ID), kw) {
+		return true
+	}
+	if sh == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(sh.Name), kw) ||
+		strings.Contains(strings.ToLower(sh.Code), kw)
+}
+
+// SetStatusIfIn 只改状态的条件置位（与 pg 同语义：状态不在 from 内则一行不改）。
+//
+// 只动 status 与 updated_at：**不回写整行**。mem 里整行写回本来不会出错，
+// 但语义必须与 pg 完全一致——否则「本地 mem 跑通、线上 pg 崩」这类事故
+// 永远发现不了（阶段 8 那条整行 UPDATE 就是这么翻车的）。
+func (r envRepo) SetStatusIfIn(ctx context.Context, id string, from []string, to string) (bool, error) {
+	tid, err := store.TenantFrom(ctx)
+	if err != nil {
+		return false, err
+	}
+	if to == "" || len(from) == 0 {
+		return false, apierr.Validation("状态置位缺少目标状态或前置状态集合")
+	}
+	e, ok := r.s.envs[id]
+	if !ok || e.TenantID != tid {
+		return false, notFound("environment", id)
+	}
+	for _, s := range from {
+		if e.Status != s {
+			continue
+		}
+		cp := *e
+		cp.Status = to
+		cp.UpdatedAt = time.Now()
+		r.s.envs[id] = &cp
+		return true, nil
+	}
+	return false, nil
+}
+
+// Delete 物理删除环境行（终态动作：出口归还与事件留痕由服务层负责）。
+// 索引（envByShop）必须一并清掉，否则「该店铺已有环境」的判定会指向幽灵行。
+func (r envRepo) Delete(ctx context.Context, id string) error {
+	tid, err := store.TenantFrom(ctx)
+	if err != nil {
+		return err
+	}
+	e, ok := r.s.envs[id]
+	if !ok || e.TenantID != tid {
+		return notFound("environment", id)
+	}
+	delete(r.s.envs, id)
+	if r.s.envByShop[e.ShopID] == id {
+		delete(r.s.envByShop, e.ShopID)
+	}
+	return nil
 }
 
 // ---------- 访问策略 ----------

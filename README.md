@@ -138,6 +138,16 @@ docs/              ADR、权限矩阵、计费规则、未实现项清单
 | `ZINIAO_LIMIT_AUDIT_RETENTION_DAYS` | `180` | 浏览类审计留存 |
 | `ZINIAO_LIMIT_EXPORT_MAX_ROWS` | `50000` | 导出行上限 |
 | `ZINIAO_LIMIT_DEVICE_PURCHASE_THRESHOLD_CNY` | `50000` | 设备申购双人复核阈值（元），见 9.5 |
+| `ZINIAO_SMTP_HOST` / `_PORT` / `_USER` / `_PASS` / `_FROM` / `_TLS_MODE` | 空 | 邮件外发通道，留空即关闭 |
+| `ZINIAO_WEBHOOK_URL` / `_SECRET` / `_MAX_RETRY` | 空 | Webhook 外发通道，留空即关闭 |
+| `ZINIAO_SMS_APP_KEY` / `_APP_SECRET` / `_SIGN_NAME` / `_TEMPLATE_CODE` | 空 | 短信通道（阿里云云市场 AppKey+AppSecret 签名）。**任一字段被设置就必须全部设置**，否则启动即报错 |
+| `ZINIAO_SMS_TEMPLATE_KEY` | `content` | 短信模板变量名 |
+| `ZINIAO_SMS_MAX_RETRY` | `0` | 短信默认**不重试**：超时失败往往已发出，重复发比漏发贵，漏发交给重投任务 |
+| `ZINIAO_NOTIFY_MIN_RISK` | `high` | 外发门槛，`medium` 会明显增加打扰 |
+| `ZINIAO_LIMIT_ENV_RECLAIM_HOURS` | `12` | 环境 `running` 状态超过该时长仍无关闭上报，巡检 `env.reclaim` 把它收回 `idle`（客户端崩溃/断电的兜底） |
+| `ZINIAO_PROXY_TEST` | `on` | 服务端代理拨测总开关（`on` \| `off`）。`on`（默认）严格：绑定代理前与启动绑定了代理的环境前都要拨测，`fail` 即阻断。`off` = 跳过健康校验：允许绑定、允许启动（不拨测），只在日志/审计留 WARN；**不得**因 `off` 禁止绑定或启动 |
+| `ZINIAO_PROXY_TEST_TARGET` | `https://api.ipify.org` | 拨测默认目标，离线/内网部署可换成内网回显地址（仅接受 http/https） |
+| `ZINIAO_PROXY_TEST_COUNTRY` | 空（关闭） | 出口国家实测目标（如 `https://ipinfo.io/json`）。空 = 不额外出网，`exit_country` 沿用台账录入值；配置了才实测，实测失败不致命、只留空并记 WARN |
 
 ---
 
@@ -173,8 +183,16 @@ TLS 基线由 uTLS 真实构造的 ClientHello 计算后回写（`app.wirePhase1
 **UA↔TLS 自洽闸门（关键）**：uTLS v1.6.7 没有 `HelloChrome_131`，131 只能复用
 `HelloChrome_120_PQ`——即实际发出的是 120 的握手。若 UA 仍声称 `Chrome/131`，
 平台把 UA 与 JA4 交叉一比就能看穿。因此 `shop.CreateEnv` 会用
-`ParseChromeMajorFromHelloID` 认出 hello_id 实际代表的版本，并把 UA 的 Chrome 版本
-一并对齐（原则：**宁可用低版本但完全自洽，也不要高版本混搭**）。
+`fingerprint.AlignKernel` 做内核对齐（原则：**宁可用低版本但完全自洽，也不要高版本混搭**），
+三条规则按优先级：**① 不得高于本机浏览器内核 ② 不得与代理实际发出的握手矛盾
+③ 在前两条之内取最高可用版本**。UA 与 UA-CH 一并对齐（只改 UA 不改 UA-CH 会被
+`uach-ua` 规则判为不自洽），UA 用桌面冻结版本（`120.0.0.0`）、完整版本（`120.0.6099.109`）
+只出现在 UA-CH——这是真实桌面 Chrome M110 起的口径。为什么不是本机版本，会写进
+自检报告的 `notes` 与 `env.created` 审计事件，不只在日志里。
+
+本机内核高于基线库上限时（例：本机 Chrome 156、基线库上限 131→120），UA 会停在
+120 并在 `notes` 里说明原因；**升级 uTLS 并在 `tls_baseline.json` 增加 156 条目后，
+无需改代码即自动对齐到 156**。
 
 | 基线 `source` | 含义 |
 |---|---|
@@ -387,7 +405,9 @@ ziniao-server.exe -ip-base-url https://api.你的代理商.com ^
 UA/时区/屏幕/WebGL/Canvas 哈希应互不相同；同一环境反复开关应完全一致（确定性，非随机）。
 
 无人值守验证（自动化用）：
-`ziniao-client.exe --server http://127.0.0.1:8080 --token <jwt> --launch-env <shopID>`（可重复）
+`ziniao-client.exe --server http://127.0.0.1:8080 --token <jwt> --launch-env <shopID>`（可重复），
+同款参数还有 `--deactivate-env <shopID>` / `--delete-env <shopID>`（删除会先收本机窗口、
+再删服务端行、最后清 `profiles/<env_id>`；回归脚本 `scripts\e2e-lifecycle.ps1`）。
 
 一键重建：`scripts\build-client-win.bat`。
 工具链全装在 D 盘（Rust `D:\rust-home`、VS2019 Build Tools `D:\VS2019`），

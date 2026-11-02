@@ -28,6 +28,7 @@ type Message struct {
 	Channels  []string
 	EventType string
 	To        string // 收件邮箱（邮件通道必需；查不到用户邮箱时为空）
+	Phone     string // 收件手机号（短信通道必需；查不到或格式非法时按终态处理）
 	CreatedAt time.Time
 }
 
@@ -134,6 +135,9 @@ func (s *Sink) RetryTenant(ctx context.Context, tenantID string) (int, int, erro
 	for i := range list {
 		n := list[i]
 		remaining := pendingChannels(n.Channels, n.DeliveredChannels, ext)
+		// 再按**当下**的偏好收敛一次：用户在通知排队期间关掉了邮件，
+		// 这一条就只该走剩余其它通道（或什么都不发），而不是照着落库时的旧清单继续发。
+		remaining = s.channelsFor(store.WithTenant(ctx, tenantID), tenantID, n.UserID, remaining)
 		switch {
 		case len(remaining) == 0:
 			// 通道全部送达但状态还没翻过来（上一次进程在写回前退出了）
@@ -208,8 +212,11 @@ func (s *Sink) dispatch(ctx context.Context, n *types.Notification, only []strin
 			Title: n.Title, Body: n.Body, Channels: n.Channels, EventType: n.EventType,
 			CreatedAt: n.CreatedAt,
 		}
-		if ch == "email" {
+		switch ch {
+		case "email":
 			m.To = recipientOf(ctx, s.st, n.UserID)
+		case SMSChannel:
+			m.Phone = phoneOf(ctx, s.st, n.UserID)
 		}
 		err := sd.Send(ctx, m)
 		switch {
@@ -251,6 +258,15 @@ func recipientOf(ctx context.Context, st store.Store, userID string) string {
 	return strings.TrimSpace(u.Email)
 }
 
+// phoneOf 取用户手机号；查不到就返回空（短信通道据此走 ErrNoRecipient 终态）。
+func phoneOf(ctx context.Context, st store.Store, userID string) string {
+	u, err := st.Users().GetByID(ctx, userID)
+	if err != nil || u == nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Phone)
+}
+
 // Name 处理器名。
 func (s *Sink) Name() string { return "notify" }
 
@@ -260,9 +276,16 @@ func (s *Sink) Types() []string {
 }
 
 // Handle 生成站内通知并外发到已启用通道。
+//
+// 接收侧投递幂等（event_consumptions）：发件箱重投会让这条事件整个重跑一遍，
+// 每个收件人的「消费登记 + 站内通知落库」必须在**同一事务**内原子提交——
+// 只重跑没登记过的收件人，已通知的人不会收到第二封。
 func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 	if ev.Risk == eventbus.RiskLow {
 		return nil
+	}
+	if consumed, err := s.st.Outbox().Consumed(ctx, ev.ID, s.Name()); err == nil && consumed {
+		return nil // 整条事件已处理完（重投或重复调用）
 	}
 	tpl := TemplateOf(ev.Type)
 	// 审批类事件走定向推送：待办必须落到"真能批这批人的人"手上。
@@ -280,24 +303,44 @@ func (s *Sink) Handle(ctx context.Context, ev *eventbus.Event) error {
 		need = append(need, ext...)
 	}
 	for _, userID := range targets {
+		// 逐收件人幂等键：中途崩溃重投时，已登记的人跳过，没登记的人补上。
+		// 查询失败不吞：当成未处理重跑，宁可依赖登记表兜底，也不静默丢通知。
+		mark := s.Name() + ":" + userID
+		if consumed, err := s.st.Outbox().Consumed(ctx, ev.ID, mark); err == nil && consumed {
+			continue
+		}
+		// 外发清单再按「这个人在本团队的偏好」收敛一次（语义与边界见 prefs.go）。
+		// 收敛必须发生在**落库之前**：Channels 写进表里就是重投任务的输入，
+		// 若按全通道落库再靠重投过滤，用户刚关掉的通道会在重投那一轮复活。
+		chs := s.channelsFor(store.WithTenant(ctx, ev.TenantID), ev.TenantID, userID, need)
 		n := &types.Notification{
 			ID: ids.New(), TenantID: ev.TenantID, UserID: userID,
 			Category: categoryOf(ev), Title: tpl.Title,
 			Body:      fmt.Sprintf("%s（%s，结果=%s，终端IP=%s）", tpl.Body, ev.Context.Action, ev.Context.Result, ev.Terminal.IP),
-			EventType: ev.Type, Channels: append([]string{ChannelInApp}, need...), CreatedAt: now,
+			EventType: ev.Type, Channels: append([]string{ChannelInApp}, chs...), CreatedAt: now,
 			DeliveryStatus: StatusNone,
 		}
-		if len(need) > 0 {
+		if len(chs) > 0 {
 			n.DeliveryStatus = StatusPending
 		}
-		// 通知写入受 RLS 保护，必须在带租户上下文的事务内完成
-		if err := s.st.Notifications().Create(store.WithTenant(ctx, ev.TenantID), n); err != nil {
+		// 通知写入受 RLS 保护，必须在带租户上下文的事务内完成；
+		// 消费登记与通知落库同事务：登记提交了通知必然在，重投不会补发第二封。
+		if err := s.st.WithTx(store.WithTenant(ctx, ev.TenantID), func(tx store.Tx) error {
+			if err := tx.Outbox().MarkConsumed(ctx, ev.ID, mark); err != nil {
+				return err
+			}
+			return tx.Notifications().Create(store.WithTenant(ctx, ev.TenantID), n)
+		}); err != nil {
 			return err
 		}
 		// 外发失败不向上抛错：站内通知已入库，抛错会让 outbox 重投整条事件、
 		// 于是再生成一条一模一样的站内通知。失败留在 delivery_status 上，
 		// 由 notify.delivery_retry 继续。
-		s.dispatch(store.WithTenant(ctx, ev.TenantID), n, need)
+		s.dispatch(store.WithTenant(ctx, ev.TenantID), n, chs)
+	}
+	// 全部收件人处理完：登记整条事件的完成标记（bus 层也会登记，双保险幂等）。
+	if err := s.st.Outbox().MarkConsumed(ctx, ev.ID, s.Name()); err != nil {
+		s.log.Warn("通知事件完成标记写入失败（不影响本轮投递）", "id", ev.ID, "err", err)
 	}
 	return nil
 }
@@ -383,6 +426,12 @@ func NewService(st store.Store) *Service { return &Service{st: st} }
 // List 站内消息列表。
 func (s *Service) List(ctx context.Context, tenantID, userID string, limit int) ([]types.Notification, error) {
 	return s.st.Notifications().List(ctx, tenantID, userID, limit)
+}
+
+// UnreadCount 未读条数（角标专用：由 SQL COUNT 得出总量，
+// 不是把最近 N 条拉回来数——后者会给出一个会被 limit 截断的假数字）。
+func (s *Service) UnreadCount(ctx context.Context, tenantID, userID string) (int, error) {
+	return s.st.Notifications().CountUnread(ctx, tenantID, userID)
 }
 
 // MarkRead 标记已读。

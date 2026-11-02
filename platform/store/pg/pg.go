@@ -97,9 +97,17 @@ func (t txStore) SecurityEvents() store.SecurityEventRepo {
 }
 func (t txStore) Vault() store.VaultRepo        { return vaultRepo{base{q: t.q, inTx: true}} }
 func (t txStore) Approvals() store.ApprovalRepo { return approvalRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Delegations() store.DelegationRepo {
+	return delegationRepo{base{q: t.q, inTx: true}}
+}
 func (t txStore) EgressBindings() store.EgressBindingRepo {
 	return egressRepo{base{q: t.q, inTx: true}}
 }
+func (t txStore) ApprovalRouteRules() store.ApprovalRouteRuleRepo {
+	return routeRuleRepo{base{q: t.q, inTx: true}}
+}
+func (t txStore) Proxies() store.ProxyRepo { return proxyRepo{base{q: t.q, inTx: true}} }
+func (t txStore) Groups() store.GroupRepo  { return groupRepo{base{q: t.q, inTx: true}} }
 
 func (s *Store) Tenants() store.TenantRepo               { return tenantRepo{base{st: s, q: s.pool}} }
 func (s *Store) Users() store.UserRepo                   { return userRepo{base{st: s, q: s.pool}} }
@@ -122,7 +130,13 @@ func (s *Store) Policies() store.AccessPolicyRepo        { return policyRepo{bas
 func (s *Store) SecurityEvents() store.SecurityEventRepo { return secEventRepo{base{st: s, q: s.pool}} }
 func (s *Store) Vault() store.VaultRepo                  { return vaultRepo{base{st: s, q: s.pool}} }
 func (s *Store) Approvals() store.ApprovalRepo           { return approvalRepo{base{st: s, q: s.pool}} }
+func (s *Store) Delegations() store.DelegationRepo       { return delegationRepo{base{st: s, q: s.pool}} }
 func (s *Store) EgressBindings() store.EgressBindingRepo { return egressRepo{base{st: s, q: s.pool}} }
+func (s *Store) ApprovalRouteRules() store.ApprovalRouteRuleRepo {
+	return routeRuleRepo{base{st: s, q: s.pool}}
+}
+func (s *Store) Proxies() store.ProxyRepo { return proxyRepo{base{st: s, q: s.pool}} }
+func (s *Store) Groups() store.GroupRepo  { return groupRepo{base{st: s, q: s.pool}} }
 
 // base 仓库公共能力：事务复用 / 非事务自动包事务。
 type base struct {
@@ -467,6 +481,27 @@ func (r roleRepo) List(ctx context.Context, tenantID string) ([]types.Role, erro
 	return out, wrapErr(err)
 }
 
+// AddPermissions 并集补齐：靠 (role_id, permission_key) 主键冲突忽略，
+// 已有的行原样不动，返回真正新增的条数（升级同步要靠这个数判断是否真的补了东西）。
+func (r roleRepo) AddPermissions(ctx context.Context, id string, perms []string) (int, error) {
+	var added int
+	err := r.run(ctx, func(q querier) error {
+		for _, p := range perms {
+			if p == "" {
+				continue
+			}
+			tag, err := q.Exec(ctx, `INSERT INTO role_permissions(role_id,permission_key)
+				VALUES($1,$2) ON CONFLICT DO NOTHING`, id, p)
+			if err != nil {
+				return err
+			}
+			added += int(tag.RowsAffected())
+		}
+		return nil
+	})
+	return added, wrapErr(err)
+}
+
 func (r roleRepo) SetPermissions(ctx context.Context, id string, perms []string) error {
 	return r.run(ctx, func(q querier) error {
 		if _, err := q.Exec(ctx, `DELETE FROM role_permissions WHERE role_id=$1`, id); err != nil {
@@ -604,6 +639,33 @@ func (r grantRepo) ListByUser(ctx context.Context, tenantID, userID, resourceTyp
 
 // DeleteExpired 用 RETURNING 一次拿回被删条目：
 // 先 SELECT 再 DELETE 在并发下会读到已经不存在的行，也会让回收与发通知之间
+// DeleteByScope 删除该用户在某 scope 下的全部授权并返回被删条目
+// （代理机构委托撤销/到期时整批回收；返回条目供事件 Data 留痕）。
+func (r grantRepo) DeleteByScope(ctx context.Context, tenantID, userID, scope string) ([]types.DataGrant, error) {
+	out := []types.DataGrant{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `DELETE FROM data_grants
+			WHERE tenant_id=$1 AND user_id=$2 AND scope=$3
+			RETURNING id,tenant_id,user_id,resource_type,COALESCE(resource_id,''),
+				COALESCE(scope,''),COALESCE(granted_by,''),expires_at,created_at`,
+			tenantID, userID, scope)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g types.DataGrant
+			if err := rows.Scan(&g.ID, &g.TenantID, &g.UserID, &g.ResourceType, &g.ResourceID,
+				&g.Scope, &g.GrantedBy, &g.ExpiresAt, &g.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, g)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
 // 出现窗口（清了行但通知没发出去，等于静默收权）。
 func (r grantRepo) DeleteExpired(ctx context.Context, tenantID string, now time.Time) ([]types.DataGrant, error) {
 	out := []types.DataGrant{}
@@ -699,10 +761,12 @@ type shopRepo struct{ base }
 
 func (r shopRepo) Create(ctx context.Context, s *types.Shop) error {
 	return r.run(ctx, func(q querier) error {
-		_, err := q.Exec(ctx, `INSERT INTO shops(id,tenant_id,name,platform,site,status,group_name,tags,device_id,owner_id,profit,cost,balance,created_at,updated_at,deleted_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		// 0012：code（自定义编号）与 group_id（显式分组）一并落库；group_name 仍双写。
+		_, err := q.Exec(ctx, `INSERT INTO shops(id,tenant_id,name,platform,site,status,group_name,group_id,code,tags,device_id,owner_id,profit,cost,balance,created_at,updated_at,deleted_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 			s.ID, s.TenantID, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status,
-			nullStr(s.Group), strArr(s.Tags), nullStr(s.DeviceID), s.OwnerID,
+			nullStr(s.Group), nullStr(s.GroupID), nullStr(s.Code),
+			strArr(s.Tags), nullStr(s.DeviceID), s.OwnerID,
 			s.Profit, s.Cost, s.Balance, s.CreatedAt, s.UpdatedAt, s.DeletedAt)
 		return wrapErr(err)
 	})
@@ -716,10 +780,10 @@ func (r shopRepo) Get(ctx context.Context, id string) (*types.Shop, error) {
 	out := &types.Shop{}
 	err = r.run(ctx, func(q querier) error {
 		return q.QueryRow(ctx, `SELECT id,tenant_id,name,COALESCE(platform,''),COALESCE(site,''),status,
-			COALESCE(group_name,''),tags,COALESCE(device_id,''),owner_id,
+			COALESCE(group_name,''),COALESCE(group_id,''),COALESCE(code,''),tags,COALESCE(device_id,''),owner_id,
 			profit,cost,balance,created_at,updated_at,deleted_at FROM shops WHERE id=$1 AND tenant_id=$2`, id, tid).
 			Scan(&out.ID, &out.TenantID, &out.Name, &out.Platform, &out.Site, &out.Status, &out.Group,
-				&out.Tags, &out.DeviceID, &out.OwnerID,
+				&out.GroupID, &out.Code, &out.Tags, &out.DeviceID, &out.OwnerID,
 				&out.Profit, &out.Cost, &out.Balance, &out.CreatedAt, &out.UpdatedAt, &out.DeletedAt)
 	})
 	if err != nil {
@@ -743,15 +807,29 @@ func (r shopRepo) List(ctx context.Context, f store.ShopFilter) ([]types.Shop, i
 		where += ` AND deleted_at IS NULL`
 	}
 	if f.Scope == "own" {
-		where += ` AND owner_id=$2`
 		args = append(args, f.OwnerID)
+		// 委托分支必须与 owner 分支同处一对括号内：AND 优先级高于 OR，
+		// 一旦写成 `... AND owner_id=$2 OR (委托...)`，委托行会绕开全部其它谓词
+		// （包括下面要加的 group_id），表现为「按分组筛选却筛出了别的组的店铺」。
+		own := `owner_id=$` + fmt.Sprint(len(args))
+		if f.DelegatedFor != "" && !f.Deleted {
+			own += ` OR (deleted_at IS NULL AND id IN
+				(SELECT resource_id FROM data_grants
+				 WHERE tenant_id=$1 AND user_id=$` + fmt.Sprint(len(args)) + ` AND resource_type='shop'
+				   AND (expires_at IS NULL OR expires_at > now())))`
+		}
+		where += ` AND (` + own + `)`
+	}
+	if f.GroupID != "" {
+		args = append(args, f.GroupID)
+		where += ` AND group_id=$` + fmt.Sprint(len(args))
 	}
 	err = r.run(ctx, func(q querier) error {
 		if err := q.QueryRow(ctx, `SELECT COUNT(*) FROM shops `+where, args...).Scan(&total); err != nil {
 			return err
 		}
 		rows, err := q.Query(ctx, `SELECT id,tenant_id,name,COALESCE(platform,''),COALESCE(site,''),status,
-			COALESCE(group_name,''),tags,COALESCE(device_id,''),owner_id,
+			COALESCE(group_name,''),COALESCE(group_id,''),COALESCE(code,''),tags,COALESCE(device_id,''),owner_id,
 			profit,cost,balance,created_at,updated_at,deleted_at FROM shops `+where+`
 			ORDER BY created_at DESC LIMIT $`+fmt.Sprint(len(args)+1)+` OFFSET $`+fmt.Sprint(len(args)+2),
 			append(args, f.Limit, f.Offset)...)
@@ -762,7 +840,7 @@ func (r shopRepo) List(ctx context.Context, f store.ShopFilter) ([]types.Shop, i
 		for rows.Next() {
 			var s types.Shop
 			if err := rows.Scan(&s.ID, &s.TenantID, &s.Name, &s.Platform, &s.Site, &s.Status, &s.Group,
-				&s.Tags, &s.DeviceID, &s.OwnerID,
+				&s.GroupID, &s.Code, &s.Tags, &s.DeviceID, &s.OwnerID,
 				&s.Profit, &s.Cost, &s.Balance, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt); err != nil {
 				return err
 			}
@@ -779,11 +857,12 @@ func (r shopRepo) Update(ctx context.Context, s *types.Shop) error {
 		return err
 	}
 	return wrapErr(r.run(ctx, func(q querier) error {
-		_, err := q.Exec(ctx, `UPDATE shops SET name=$3,platform=$4,site=$5,status=$6,group_name=$7,tags=$8,
-			device_id=$9,owner_id=$10,profit=$11,cost=$12,balance=$13,updated_at=$14,deleted_at=$15
+		_, err := q.Exec(ctx, `UPDATE shops SET name=$3,platform=$4,site=$5,status=$6,group_name=$7,group_id=$8,code=$9,tags=$10,
+			device_id=$11,owner_id=$12,profit=$13,cost=$14,balance=$15,updated_at=$16,deleted_at=$17
 			WHERE id=$1 AND tenant_id=$2`,
 			s.ID, tid, s.Name, nullStr(s.Platform), nullStr(s.Site), s.Status, nullStr(s.Group),
-			strArr(s.Tags), nullStr(s.DeviceID), s.OwnerID, s.Profit, s.Cost, s.Balance, s.UpdatedAt, s.DeletedAt)
+			nullStr(s.GroupID), nullStr(s.Code), strArr(s.Tags),
+			nullStr(s.DeviceID), s.OwnerID, s.Profit, s.Cost, s.Balance, s.UpdatedAt, s.DeletedAt)
 		return err
 	}))
 }
@@ -923,6 +1002,37 @@ func (r outboxRepo) Fail(ctx context.Context, id, errMsg string) error {
 			last_error=$2, available_at=now() + make_interval(secs => attempts::double precision) WHERE id=$1`, id, errMsg)
 		return wrapErr(err)
 	})
+}
+
+// Consumed 接收侧投递幂等（event_consumptions，migration 0011）。
+// 显式带 tenant_id 谓词：本表只 ENABLE 不 FORCE RLS，表主连接不受策略约束
+// （与 egress_binding_history 同口径）——隔离靠仓储注入租户，RLS 只是最后一道。
+func (r outboxRepo) Consumed(ctx context.Context, eventID, handler string) (bool, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return false, err
+	}
+	var ok bool
+	err = r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM event_consumptions WHERE event_id=$1 AND handler=$2 AND tenant_id=$3)`,
+			eventID, handler, tid).Scan(&ok)
+	})
+	return ok, wrapErr(err)
+}
+
+// MarkConsumed 登记消费完成（ON CONFLICT DO NOTHING：重投/重试下幂等）。
+// tenant_id 取自 ctx（RLS WITH CHECK 校验），与业务写同事务提交时天然一致。
+func (r outboxRepo) MarkConsumed(ctx context.Context, eventID, handler string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO event_consumptions(event_id,handler,tenant_id)
+			VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, eventID, handler, tid)
+		return err
+	}))
 }
 
 // ---------- 审计 ----------
@@ -1162,6 +1272,54 @@ func (r notifRepo) UpdateDelivery(ctx context.Context, n *types.Notification) er
 	})
 }
 
+// CountUnread 未读条数：read_at IS NULL。
+// 用 SQL COUNT 而不是把列表拉回来数——后者只能数到 limit 条，
+// 角标会显示假的未读数（"3+"这种含糊写法正是为了避免这个 bug，但真相更省事）。
+func (r notifRepo) CountUnread(ctx context.Context, tenantID, userID string) (int, error) {
+	n := 0
+	err := r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT COUNT(*) FROM notifications
+			WHERE tenant_id=$1 AND user_id=$2 AND read_at IS NULL`, tenantID, userID).Scan(&n)
+	})
+	return n, wrapErr(err)
+}
+
+// GetPrefs 取通知偏好。无行返回 (nil, nil)：语义是「用户没设置过」，
+// 由上层按默认（全部已装配通道）处理。
+func (r notifRepo) GetPrefs(ctx context.Context, tenantID, userID string) (*types.NotificationPrefs, error) {
+	var out *types.NotificationPrefs
+	err := r.run(ctx, func(q querier) error {
+		var chs []string
+		var updated time.Time
+		err := q.QueryRow(ctx, `SELECT channels,updated_at FROM notification_prefs
+			WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID).Scan(&chs, &updated)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // 未设置
+			}
+			return err
+		}
+		out = &types.NotificationPrefs{TenantID: tenantID, UserID: userID, Channels: chs, UpdatedAt: updated}
+		return nil
+	})
+	return out, wrapErr(err)
+}
+
+// SetPrefs 写通知偏好（UPSERT）。注意 tenant_id 来自**传入的结构**而非上下文：
+// 表 owner 不受 RLS 限制，写路径的显式谓词才是防线（既有约定）。
+func (r notifRepo) SetPrefs(ctx context.Context, p *types.NotificationPrefs) error {
+	if p.Channels == nil {
+		p.Channels = []string{}
+	}
+	return r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO notification_prefs(tenant_id,user_id,channels,updated_at)
+			VALUES($1,$2,$3,now())
+			ON CONFLICT (tenant_id,user_id) DO UPDATE SET channels=EXCLUDED.channels,updated_at=now()`,
+			p.TenantID, p.UserID, jsonOf(p.Channels))
+		return err
+	})
+}
+
 // ListPendingDelivery 待重投通知（与 mem 同语义：pending/failed，created_at 升序）。
 func (r notifRepo) ListPendingDelivery(ctx context.Context, tenantID string, limit int) ([]types.Notification, error) {
 	if limit <= 0 {
@@ -1192,6 +1350,29 @@ func nullStr(s string) any {
 	return s
 }
 
+// nullTime 写可空 timestamptz 列：nil 指针 → SQL NULL。
+//
+// 直接把 *time.Time 交给 pgx 在 v5 下未必走「指针解引用」语义，
+// 显式转换一次比赌驱动行为便宜——空值落错（写进零值时间）会让
+// 「这个环境上次什么时候开的」变成一个 0001 年的假答案。
+func nullTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return *t
+}
+
+// timePtr 读可空 timestamptz 列：零值时间视为 NULL。
+// 与 nullTime 成对：读路径用 COALESCE(last_started_at, '0001-01-01') 兜底，
+// 因此「零值」只可能是「列里本来就是 NULL」。
+func timePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	cp := t
+	return &cp
+}
+
 // strArr 归一化写入 text[] NOT NULL 列的 Go 切片。
 //
 // 必要性（PG 实跑 0001/0002/0003 时暴露，mem 实现永远发现不了）：
@@ -1213,6 +1394,17 @@ func strArr(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// jsonOf 归一化写入 jsonb NOT NULL 列的通道列表。
+// 与 strArr 同理：nil 切片必须先落成 `[]`，否则写进去的是 JSON null，
+// 读回来 channels 字段为 null，上层解析分支又要多一种。
+func jsonOf(s []string) []byte {
+	if s == nil {
+		s = []string{}
+	}
+	b, _ := json.Marshal(s)
+	return b
 }
 
 func isNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }

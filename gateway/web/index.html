@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>紫鸟浏览器管理系统</title>
+<title>紫鸟浏览器 · 启动器</title>
 <link rel="stylesheet" href="/static/web/style.css">
 </head>
 <body>
@@ -11,8 +11,9 @@
 <!-- 登录页 -->
 <div id="login-view" class="login-wrap hidden">
   <form class="login-card" onsubmit="return doLogin(event)">
-    <h1>跨境电商账号安全管理系统</h1>
-    <p class="muted">紫鸟浏览器 · Phase 2 控制台</p>
+    <div class="login-brand">紫鸟浏览器</div>
+    <h1>账号安全管理系统</h1>
+    <p class="muted">启动器 · 本机环境管理</p>
     <label>用户名 <input id="login-user" autocomplete="username" required></label>
     <label>口令 <input id="login-pass" type="password" autocomplete="current-password" required></label>
     <button class="primary" type="submit">登 录</button>
@@ -24,7 +25,7 @@
 <!-- 主界面 -->
 <div id="app-view" class="hidden">
   <aside class="sidebar">
-    <div class="brand">紫鸟 · 管理台</div>
+    <div class="brand">紫鸟 · 启动器</div>
     <nav id="nav"></nav>
     <div class="sidebar-foot">
       <div id="whoami" class="muted small"></div>
@@ -32,7 +33,10 @@
     </div>
   </aside>
   <main class="main">
-    <header class="topbar"><h2 id="section-title"></h2><span id="section-note" class="muted small"></span></header>
+    <header class="topbar">
+      <h2 id="section-title"></h2>
+      <span id="section-note" class="muted small"></span>
+    </header>
     <section id="content"></section>
   </main>
 </div>

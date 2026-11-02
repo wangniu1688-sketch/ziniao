@@ -45,6 +45,15 @@ func (v *Vault) Put(ctx context.Context, in PutInput) error {
 	if !d.Allow {
 		return apierr.Forbidden("无权维护店铺凭证（" + string(d.Layer) + "）")
 	}
+	// 数据级收口：own 范围下只能维护本人（或被委托）店铺的凭证
+	tctx := store.WithTenant(ctx, in.Actor.TenantID)
+	sp, err := v.st.Shops().Get(tctx, in.ShopID)
+	if err != nil {
+		return err
+	}
+	if err := checkShopAccess(v.st, tctx, d, in.Actor, sp, "维护他人店铺的凭证"); err != nil {
+		return err
+	}
 	if in.Secret == "" {
 		return apierr.Validation("凭证内容不能为空")
 	}
@@ -52,7 +61,6 @@ func (v *Vault) Put(ctx context.Context, in PutInput) error {
 	if err != nil {
 		return apierr.Internal("凭证加密失败")
 	}
-	tctx := store.WithTenant(ctx, in.Actor.TenantID)
 	now := time.Now().UTC()
 	cred := &types.ShopCredential{
 		ID: ids.New(), TenantID: in.Actor.TenantID, ShopID: in.ShopID, Kind: in.Kind,
@@ -98,6 +106,16 @@ func (v *Vault) Reveal(ctx context.Context, in RevealInput) (string, error) {
 		return "", apierr.Forbidden("无权查看凭证明文（" + string(d.Layer) + "）")
 	}
 	tctx := store.WithTenant(ctx, in.Actor.TenantID)
+	// 数据级收口：own 范围下只能查看本人（或被委托）店铺的凭证。
+	// 拒绝同样落高危审计（与功能层拒绝同一口径），明文从未离开密文层。
+	sp, err := v.st.Shops().Get(tctx, in.ShopID)
+	if err != nil {
+		return "", err
+	}
+	if err := checkShopAccess(v.st, tctx, d, in.Actor, sp, "查看他人店铺的凭证"); err != nil {
+		_ = v.record(ctx, in, "denied")
+		return "", err
+	}
 	cred, err := v.st.Vault().Get(tctx, in.ShopID, in.Kind)
 	if err != nil {
 		return "", err
@@ -112,8 +130,20 @@ func (v *Vault) Reveal(ctx context.Context, in RevealInput) (string, error) {
 }
 
 // ListKinds 列出店铺已托管的凭证类型（不含任何密文）。
-func (v *Vault) ListKinds(ctx context.Context, tenantID, shopID string) ([]string, error) {
-	tctx := store.WithTenant(ctx, tenantID)
+// 服务层完整裁决（功能权限 + 数据级收口）：网关做一次、服务再核一次，与 Put/Reveal 同口径。
+func (v *Vault) ListKinds(ctx context.Context, actor iam.Subject, shopID string) ([]string, error) {
+	d := v.engine.Check(ctx, iam.Request{Subject: actor, Action: "shop:credential.manage", Path: "/shops"})
+	if !d.Allow {
+		return nil, apierr.Forbidden("无权查看店铺凭证（" + string(d.Layer) + "）")
+	}
+	tctx := store.WithTenant(ctx, actor.TenantID)
+	sp, err := v.st.Shops().Get(tctx, shopID)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkShopAccess(v.st, tctx, d, actor, sp, "查看他人店铺的凭证"); err != nil {
+		return nil, err
+	}
 	list, err := v.st.Vault().List(tctx, shopID)
 	if err != nil {
 		return nil, err
@@ -126,8 +156,19 @@ func (v *Vault) ListKinds(ctx context.Context, tenantID, shopID string) ([]strin
 }
 
 // RotateKey 密钥轮换：把该店铺全部凭证用当前主密钥版本重封（不解业务明文以外的东西）。
-func (v *Vault) RotateKey(ctx context.Context, tenantID, shopID string, actor iam.Subject, term eventbus.Terminal) (int, error) {
-	tctx := store.WithTenant(ctx, tenantID)
+func (v *Vault) RotateKey(ctx context.Context, shopID string, actor iam.Subject, term eventbus.Terminal) (int, error) {
+	d := v.engine.Check(ctx, iam.Request{Subject: actor, Action: "shop:credential.manage", Path: "/shops"})
+	if !d.Allow {
+		return 0, apierr.Forbidden("无权维护店铺凭证（" + string(d.Layer) + "）")
+	}
+	tctx := store.WithTenant(ctx, actor.TenantID)
+	sp, err := v.st.Shops().Get(tctx, shopID)
+	if err != nil {
+		return 0, err
+	}
+	if err := checkShopAccess(v.st, tctx, d, actor, sp, "轮换他人店铺的凭证密钥"); err != nil {
+		return 0, err
+	}
 	list, err := v.st.Vault().List(tctx, shopID)
 	if err != nil {
 		return 0, err
@@ -149,7 +190,7 @@ func (v *Vault) RotateKey(ctx context.Context, tenantID, shopID string, actor ia
 	if n > 0 {
 		_ = v.st.WithTx(tctx, func(tx store.Tx) error {
 			return v.bus.Emit(tctx, tx, eventbus.Event{
-				TenantID: tenantID, Type: "shop.credential.rotated", OccurredAt: time.Now().UTC(),
+				TenantID: actor.TenantID, Type: "shop.credential.rotated", OccurredAt: time.Now().UTC(),
 				Actor: actorOf(actor), Subject: eventbus.Subject{ShopID: shopID}, Terminal: term,
 				Context: eventbus.ContextInfo{Action: "shop.credential.rotate", Result: "success"},
 				Data:    map[string]any{"count": n, "key_version": v.cipher.CurrentVersion()},

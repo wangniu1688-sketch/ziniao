@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <!-- ipc: / http://ipc.localhost 是 Tauri 在 Windows 上的 IPC 通道，connect-src 不放行 invoke 就发不出去 -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost" />
+  <title>环境浏览器</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #101728; color: #e8edf8;
+      font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; user-select: none; }
+    #bar { display: flex; flex-direction: column; height: 100%; }
+    /* 导航行 46px + 信息条 26px = 72px，必须与 Rust 侧 env_window::BAR_H 严格一致（改一边必改另一边） */
+    #nav { display: flex; align-items: center; gap: 6px; height: 46px; padding: 0 10px;
+      background: linear-gradient(90deg, #16203a, #101728); border-bottom: 1px solid #26304a; }
+    #nav button { width: 36px; padding: 6px 0; }
+    #addr { flex: 1; background: #1a2338; border: 1px solid #26304a; color: #e8edf8;
+      border-radius: 8px; padding: 6px 10px; font-size: 13px; user-select: text; }
+    button { background: #4d7fff; border: none; color: #fff; border-radius: 8px;
+      padding: 6px 12px; cursor: pointer; font-size: 13px; }
+    #info { display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 10px;
+      background: #0d1322; border-bottom: 1px solid #1d2540; color: #8d9ab8; font-size: 12px;
+      white-space: nowrap; overflow: hidden; }
+    .chip { display: inline-block; padding: 0 8px; border-radius: 10px;
+      background: rgba(77,127,255,.12); border: 1px solid rgba(77,127,255,.3); }
+    .chip.ok { background: rgba(52,211,153,.14); color: #34d399; border-color: rgba(52,211,153,.35); }
+    .chip.warn { background: rgba(248,113,113,.14); color: #f87171; border-color: rgba(248,113,113,.35); }
+    #msg { margin-left: auto; color: #f87171; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <div id="nav">
+      <button id="back" title="后退">◀</button>
+      <button id="fwd" title="前进">▶</button>
+      <button id="reload" title="刷新">⟳</button>
+      <input id="addr" spellcheck="false" placeholder="输入网址，回车打开" />
+    </div>
+    <div id="info">
+      <span class="chip" id="chipShop"></span>
+      <span class="chip" id="chipEnv"></span>
+      <span class="chip" id="chipKernel"></span>
+      <span class="chip" id="chipCountry"></span>
+      <span class="chip" id="chipProxy"></span>
+      <span id="msg"></span>
+    </div>
+  </div>
+  <script type="module">
+    // 环境信息由 Rust 侧经注入脚本写入（window.__ZINIAO_ENV__）；导航只经 invoke(env_nav)
+    // 交给 Rust 侧执行——工具条自己不碰网页，真正的 UA/注入/profile/代理全在网页 webview 上。
+    import { invoke } from './api/core.js';
+
+    const $ = (id) => document.getElementById(id);
+    const env = window.__ZINIAO_ENV__ || {};
+
+    // 网页 webview 每次导航都由 Rust 侧回写地址（on_navigation / on_page_load）
+    window.__ZINIAO_SET_URL__ = (u) => { if (document.activeElement !== $('addr')) $('addr').value = u; };
+
+    let msgTimer = null;
+    function flash(text) {
+      $('msg').textContent = text;
+      clearTimeout(msgTimer);
+      msgTimer = setTimeout(() => { $('msg').textContent = ''; }, 4000);
+    }
+
+    async function nav(action, url) {
+      if (!env.window) return;
+      try {
+        await invoke('env_nav', { input: { window: env.window, action, url: url || '' } });
+      } catch (e) {
+        flash('导航失败：' + (e && e.message ? e.message : String(e)));
+      }
+    }
+
+    $('back').onclick = () => nav('back');
+    $('fwd').onclick = () => nav('forward');
+    $('reload').onclick = () => nav('reload');
+    $('addr').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        nav('go', $('addr').value.trim());
+        $('addr').blur();
+      }
+    });
+
+    // 环境信息条：运营要一眼看出"这是哪个店、哪个环境、从哪个国家出去"
+    $('chipShop').textContent = env.shop || '-';
+    $('chipEnv').textContent = '环境 ' + (env.env || '-');
+    $('chipKernel').textContent = 'Chrome ' + (env.kernel === undefined ? '-' : env.kernel);
+    $('chipCountry').textContent = env.country || '-';
+    const proxyChip = $('chipProxy');
+    proxyChip.textContent = env.proxy || '-';
+    proxyChip.className = 'chip ' + (String(env.proxy || '').indexOf('代理') === 0 ? 'ok' : 'warn');
+    window.__ZINIAO_SET_URL__(env.url || '');
+  </script>
+</body>
+</html>

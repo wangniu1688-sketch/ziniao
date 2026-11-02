@@ -136,8 +136,8 @@ func TestAllocatorReapsExpired(t *testing.T) {
 	}
 	// 覆写到期时间为过去
 	a.mu.Lock()
-	if r, ok := a.resources[a.byEnv["env-1"]]; ok {
-		r.ExpiresAt = time.Now().Add(-time.Minute)
+	if hr, ok := a.resources[a.byEnv["env-1"]]; ok {
+		hr.res.ExpiresAt = time.Now().Add(-time.Minute)
 	}
 	a.mu.Unlock()
 	if n := a.Reap(ctx); n != 1 {
@@ -178,8 +178,8 @@ func TestAllocatorDetectsExitRotation(t *testing.T) {
 
 	// 资源过期被回收后重启环境：出口必变，必须能对比出旧出口
 	a.mu.Lock()
-	for _, r := range a.resources {
-		r.ExpiresAt = time.Now().Add(-time.Minute)
+	for _, hr := range a.resources {
+		hr.res.ExpiresAt = time.Now().Add(-time.Minute)
 	}
 	a.mu.Unlock()
 	a.Reap(ctx)

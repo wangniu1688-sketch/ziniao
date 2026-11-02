@@ -20,6 +20,7 @@ import (
 type env struct {
 	svc    *approval.Service
 	st     *mem.Store
+	bus    *eventbus.Bus
 	owner  iam.Subject
 	leader iam.Subject
 	boss2  iam.Subject
@@ -50,7 +51,7 @@ func newEnv(t *testing.T) *env {
 	engine := iam.NewEngine(cfg)
 	return &env{
 		svc: approval.NewService(st, bus, cfg, engine),
-		st:  st,
+		st:  st, bus: bus,
 		owner: iam.Subject{
 			UserID: "u-owner", TenantID: "t1", Username: "owner", Roles: []types.Role{*ownerRole},
 		},

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"ziniao/platform/apierr"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 )
@@ -160,3 +161,120 @@ func (r approvalRepo) ExpireBefore(ctx context.Context, at time.Time) (int, erro
 }
 
 var _ store.ApprovalRepo = approvalRepo{}
+
+// ---------- 审批路由规则（租户可配） ----------
+
+type routeRuleRepo struct{ base }
+
+func (r routeRuleRepo) Create(ctx context.Context, rule *types.ApprovalRouteRule) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO approval_route_rules(id,tenant_id,ticket_type,min_amount,
+			roles,min_approvers,reason,priority,enabled,created_at,updated_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			rule.ID, tid, rule.TicketType, rule.MinAmount,
+			// text[] NOT NULL：nil 切片会被编码成 NULL，而 DEFAULT '{}' 只在省略该列时生效
+			strArr(rule.Roles), rule.MinApprovers, rule.Reason, rule.Priority,
+			rule.Enabled, rule.CreatedAt, rule.UpdatedAt)
+		return err
+	}))
+}
+
+func (r routeRuleRepo) Get(ctx context.Context, id string) (*types.ApprovalRouteRule, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &types.ApprovalRouteRule{}
+	err = r.run(ctx, func(q querier) error {
+		return q.QueryRow(ctx, `SELECT id,tenant_id,ticket_type,min_amount::float8,roles,
+			min_approvers,COALESCE(reason,''),priority,enabled,created_at,updated_at
+			FROM approval_route_rules WHERE id=$1 AND tenant_id=$2`, id, tid).
+			Scan(&out.ID, &out.TenantID, &out.TicketType, &out.MinAmount, &out.Roles,
+				&out.MinApprovers, &out.Reason, &out.Priority, &out.Enabled,
+				&out.CreatedAt, &out.UpdatedAt)
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return out, nil
+}
+
+func (r routeRuleRepo) Update(ctx context.Context, rule *types.ApprovalRouteRule) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	n := 0
+	err = r.run(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx, `UPDATE approval_route_rules SET ticket_type=$3,min_amount=$4,roles=$5,
+			min_approvers=$6,reason=$7,priority=$8,enabled=$9,updated_at=$10
+			WHERE id=$1 AND tenant_id=$2`,
+			rule.ID, tid, rule.TicketType, rule.MinAmount, strArr(rule.Roles),
+			rule.MinApprovers, rule.Reason, rule.Priority, rule.Enabled, rule.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		n = int(tag.RowsAffected())
+		return nil
+	})
+	if err != nil {
+		return wrapErr(err)
+	}
+	if n == 0 {
+		return apierr.NotFound("审批路由规则不存在")
+	}
+	return nil
+}
+
+// ListByTenant 按优先级升序返回（含停用行，停用判定在服务层）。
+func (r routeRuleRepo) ListByTenant(ctx context.Context, tenantID string) ([]types.ApprovalRouteRule, error) {
+	out := []types.ApprovalRouteRule{}
+	err := r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,ticket_type,min_amount::float8,roles,
+			min_approvers,COALESCE(reason,''),priority,enabled,created_at,updated_at
+			FROM approval_route_rules WHERE tenant_id=$1 ORDER BY priority ASC, created_at ASC`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r types.ApprovalRouteRule
+			if err := rows.Scan(&r.ID, &r.TenantID, &r.TicketType, &r.MinAmount, &r.Roles,
+				&r.MinApprovers, &r.Reason, &r.Priority, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
+func (r routeRuleRepo) Delete(ctx context.Context, id string) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	n := 0
+	err = r.run(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx, `DELETE FROM approval_route_rules WHERE id=$1 AND tenant_id=$2`, id, tid)
+		if err != nil {
+			return err
+		}
+		n = int(tag.RowsAffected())
+		return nil
+	})
+	if err != nil {
+		return wrapErr(err)
+	}
+	if n == 0 {
+		return apierr.NotFound("审批路由规则不存在")
+	}
+	return nil
+}
+
+var _ store.ApprovalRouteRuleRepo = routeRuleRepo{}

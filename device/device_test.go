@@ -29,6 +29,7 @@ func newEnv(t *testing.T, tweak func(c *config.Config)) *env {
 	cfg := config.Default()
 	cfg.StoreDriver = "memory"
 	cfg.JWTSecret = "test-secret"
+	cfg.DataDir = t.TempDir() // 避免测试在包目录下建 ./data 并互相抢实例锁
 	if tweak != nil {
 		tweak(cfg)
 	}

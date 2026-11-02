@@ -8,7 +8,6 @@ import (
 
 	"ziniao/iam"
 	"ziniao/platform/apierr"
-	"ziniao/platform/config"
 	"ziniao/platform/store"
 	"ziniao/platform/types"
 )
@@ -25,10 +24,17 @@ type Requirement struct {
 	MinApprovers int `json:"min_approvers"`
 	// Reason 为什么这条单需要这个级别（展示给申请人，避免“为什么我不能批”的黑箱）。
 	Reason string `json:"reason,omitempty"`
+	// Source 判定来源：custom（租户配置）/ builtin（内置默认）/ fallback（无规则命中）。
+	// 展示在审批页与事件里——"这张单为什么是这个级别"必须能当场回答，不能靠猜。
+	Source string `json:"source,omitempty"`
+	// RuleID 命中的租户规则（custom 时有值），便于从一张单反查是哪条规则生效。
+	RuleID string `json:"rule_id,omitempty"`
 }
 
 // rule 路由规则。刻意做成数据表而非散落在 if 里：
-// 未来从 approval_flows 表加载时，只需要替换 rulesOf 的数据来源，判定逻辑不动。
+// 租户可配的规则存 approval_route_rules（migration 0010），由 RequiredFor 优先命中；
+// 内置规则只是「没配的时候走什么」的默认值。
+// 注意：approval_flows（migration 0007）是**代理机构委托审批**的表（delegation 包），不是这张路由规则表。
 type rule struct {
 	ticketType   string  // 空表示适用于所有类型（兜底规则）
 	minAmount    float64 // 金额（CNY）下限；0 表示不卡金额
@@ -37,14 +43,16 @@ type rule struct {
 	reason       string
 }
 
-// rulesOf 内置路由规则。顺序敏感：取**第一条**命中的规则。
+// builtinRules 内置路由规则。顺序敏感：取**第一条**命中的规则。
+//
+// 这是「租户没配规则时的默认值」，不再是唯一真相——运营可在控制台配置
+// approval_route_rules（优先级更高），改阈值与审批级别不必发版。
 //
 // 关于 MinApprovers：大额设备申购为 2（双人复核），其余为 1。
 // 会签判定逻辑见 decide 里的 quorum 分支，生产入口是
 // 网关 `POST /api/v1/devices/purchase`（金额超阈值时必须持证）——
 // 也就是说，这条规则现在是真的会被执行到的，改动前请先看那条链路上的测试。
-// 规则数据要能由运营后台配置，还需 approval_flows 表（见 TODO-phase2 第 5 条）。
-func rulesOf(amountOwnerThreshold float64) []rule {
+func builtinRules(amountOwnerThreshold float64) []rule {
 	return []rule{
 		{
 			// 明文导出审计日志 = 把**全团队**的操作记录一次性带出库外，
@@ -107,21 +115,40 @@ func amountOfTicket(t *types.ApprovalTicket) float64 {
 
 // RequiredFor 计算某张单的审批要求。
 //
-// 这是纯函数（不碰存储），因此可以被单元测试完整覆盖——
-// 路由规则最容易出的问题是"金额刚好卡在阈值上"，必须能直接断言。
-func (s *Service) RequiredFor(t *types.ApprovalTicket) Requirement {
+// 判定顺序：租户规则（按 priority 升序取第一条命中）→ 内置规则 → 兜底（任意审批人）。
+// 命中不了租户规则时要**回落内置**而不是直接兜底：运营只配了「≥5 万双人复核」
+// 就来了一张 1 千的单，若直接兜底成「谁都能批」，等于配了一半反而把级别降下去了；
+// 而配了半套规则就把流程变成无人可批的死锁同样不可接受——内置规则正是这两者的平衡点。
+//
+// 读规则失败时回落内置规则而不报错：内置就是今天的既有行为（不构成降级），
+// 且后台读接口会把读失败直接暴露给运营，失败不会两边都沉默。
+func (s *Service) RequiredFor(ctx context.Context, t *types.ApprovalTicket) Requirement {
 	if t == nil {
 		return Requirement{MinApprovers: 1}
 	}
-	// 阈值必须走同一个取值口径：网关判断「要不要持证」用的也是 PurchaseOwnerThresholdCNY。
-	// 若两边口径不一致，会出现「网关放行但单据要求双人签署」或反之——这种错现场看起来
-	// 像随机抽风，实际是配置被读了两次。
-	threshold := config.Default().Limits.PurchaseOwnerThresholdCNY()
-	if s.cfg != nil {
-		threshold = s.cfg.Limits.PurchaseOwnerThresholdCNY()
-	}
 	amount := amountOfTicket(t)
-	for _, r := range rulesOf(threshold) {
+	custom, err := s.loadRules(ctx, t.TenantID)
+	if err != nil {
+		custom = nil
+	}
+	for _, r := range custom {
+		if !r.Enabled {
+			continue
+		}
+		if r.TicketType != "" && r.TicketType != t.Type {
+			continue
+		}
+		if r.MinAmount > 0 && amount < r.MinAmount {
+			continue
+		}
+		roles := append([]string{}, r.Roles...)
+		n := r.MinApprovers
+		if n <= 0 {
+			n = 1
+		}
+		return Requirement{Roles: roles, MinApprovers: n, Reason: r.Reason, Source: "custom", RuleID: r.ID}
+	}
+	for _, r := range builtinRules(s.threshold()) {
 		if r.ticketType != "" && r.ticketType != t.Type {
 			continue
 		}
@@ -133,10 +160,10 @@ func (s *Service) RequiredFor(t *types.ApprovalTicket) Requirement {
 		if n <= 0 {
 			n = 1
 		}
-		return Requirement{Roles: roles, MinApprovers: n, Reason: r.reason}
+		return Requirement{Roles: roles, MinApprovers: n, Reason: r.reason, Source: "builtin"}
 	}
 	// 兜底：任何有审批权的人（但要排除申请人，这条硬约束在 CanApprove 里）
-	return Requirement{MinApprovers: 1}
+	return Requirement{MinApprovers: 1, Source: "fallback"}
 }
 
 // ApproverCandidate 合格审批人。
@@ -154,7 +181,7 @@ func (s *Service) ResolveApprovers(ctx context.Context, tenantID string, t *type
 	if tenantID == "" || t == nil {
 		return nil, nil
 	}
-	req := s.RequiredFor(t)
+	req := s.RequiredFor(ctx, t)
 	tctx := store.WithTenant(ctx, tenantID)
 	urs, err := s.st.UserRoles().ListByTenant(tctx, tenantID)
 	if err != nil {
@@ -188,14 +215,14 @@ func (s *Service) ResolveApprovers(ctx context.Context, tenantID string, t *type
 
 // CanApprove 判断 actor 是否具备审批该单的资格。
 // 返回 nil 表示通过；否则返回可直接抛给 API 层的错误。
-func (s *Service) CanApprove(t *types.ApprovalTicket, actor iam.Subject) error {
+func (s *Service) CanApprove(ctx context.Context, t *types.ApprovalTicket, actor iam.Subject) error {
 	if t == nil {
 		return apierr.Validation("审批单不存在")
 	}
 	if t.RequesterID == actor.UserID {
 		return apierr.Forbidden("申请人与审批人不能是同一人（职责分离）")
 	}
-	req := s.RequiredFor(t)
+	req := s.RequiredFor(ctx, t)
 	if roleAllowed(req, roleCodes(actor)...) {
 		return nil
 	}

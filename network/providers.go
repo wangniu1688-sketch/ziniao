@@ -39,7 +39,13 @@ type MockProvider struct {
 	Country string
 	Type    ASNType
 	City    string
-	issued  map[string]*AcquiredProxy
+	// VendorName 路由表里的名字。多代理商测试要靠它区分两家：
+	// 名字相同的两家在归还时会互相串线（egress_bindings.provider 认名字）。
+	VendorName string
+	// PortOffset 端口偏移：让两家 mock 发出不一样的出口地址，
+	// 否则分配器按代理商分域判重，两个不同代理商的出口会一模一样，测试看不出问题。
+	PortOffset int
+	issued     map[string]*AcquiredProxy
 }
 
 // NewMockProvider 构造 mock 代理商。
@@ -47,7 +53,12 @@ func NewMockProvider(country string, t ASNType, city string) *MockProvider {
 	return &MockProvider{Country: country, Type: t, City: city, issued: map[string]*AcquiredProxy{}}
 }
 
-func (p *MockProvider) Name() string { return "mock" }
+func (p *MockProvider) Name() string {
+	if p.VendorName != "" {
+		return p.VendorName
+	}
+	return "mock"
+}
 
 func (p *MockProvider) ListRegions(_ context.Context) ([]Region, error) {
 	return []Region{{Code: p.Country + "-" + p.City, Country: p.Country, City: p.City, ASNType: p.Type}}, nil
@@ -56,12 +67,17 @@ func (p *MockProvider) ListRegions(_ context.Context) ([]Region, error) {
 func (p *MockProvider) Acquire(_ context.Context, r Region) (*AcquiredProxy, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// 字面量构造（&MockProvider{...}）时 issued 是 nil，直接写会 panic。
+	// 兜底初始化而不是要求调用方必须走构造函数：零值可用的结构体才不容易被用错。
+	if p.issued == nil {
+		p.issued = map[string]*AcquiredProxy{}
+	}
 	p.seq++
 	id := fmt.Sprintf("mock-%d", p.seq)
 	out := &AcquiredProxy{
 		ID: id,
 		Proxy: ProxyConfig{
-			ID: id, Protocol: ProtoSOCKS5, Host: "127.0.0.1", Port: 10800 + p.seq,
+			ID: id, Protocol: ProtoSOCKS5, Host: "127.0.0.1", Port: 10800 + p.PortOffset + p.seq,
 			Country: r.Country, City: r.City, ASNType: r.ASNType,
 		},
 		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
