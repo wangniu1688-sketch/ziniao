@@ -276,7 +276,20 @@ func Load() *Config {
 	c.StoreDriver = envStr("ZINIAO_STORE_DRIVER", c.StoreDriver)
 	c.PostgresDSN = envStr("ZINIAO_POSTGRES_DSN", c.PostgresDSN)
 	c.JWTSecret = envStr("ZINIAO_JWT_SECRET", c.JWTSecret)
-	c.KEKKeys, c.KEKCurrentVersion, c.KEKConfigError = parseKEKKeyring(os.Getenv("ZINIAO_KEK_KEYS"), envInt("ZINIAO_KEK_CURRENT_VERSION", 1))
+	currentKEKVersion := 1
+	if rawVersion := strings.TrimSpace(os.Getenv("ZINIAO_KEK_CURRENT_VERSION")); rawVersion != "" {
+		parsed, parseErr := strconv.Atoi(rawVersion)
+		if parseErr != nil || parsed <= 0 {
+			c.KEKConfigError = "ZINIAO_KEK_CURRENT_VERSION 必须是正整数"
+		} else {
+			currentKEKVersion = parsed
+		}
+	}
+	var keyringErr string
+	c.KEKKeys, c.KEKCurrentVersion, keyringErr = parseKEKKeyring(os.Getenv("ZINIAO_KEK_KEYS"), currentKEKVersion)
+	if c.KEKConfigError == "" {
+		c.KEKConfigError = keyringErr
+	}
 	c.DemoSite = envBool("ZINIAO_DEMO_SITE", c.DemoSite)
 	// 启动器内核（M1）
 	c.DataDir = envStr("ZINIAO_DATA_DIR", c.DataDir)
