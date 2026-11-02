@@ -3,6 +3,9 @@ package crypto_test
 import (
 	"strings"
 	"testing"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"time"
 
 	"ziniao/platform/crypto"
@@ -52,6 +55,29 @@ func TestJWT(t *testing.T) {
 	parts := strings.Split(token, ".")
 	if _, err := crypto.ParseJWT("secret", parts[0]+"."+parts[1]+"."+parts[2]+"x"); err == nil {
 		t.Fatal("篡改签名不应通过")
+	}
+	if _, err := crypto.ParseJWT("", token); err == nil {
+		t.Fatal("空密钥不应通过")
+	}
+
+	// 头部算法必须固定为 HS256，即使攻击者能用相同密钥重新签名也不能放行。
+	algHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := parts[1]
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write([]byte(algHeader + "." + payload))
+	algToken := algHeader + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if _, err := crypto.ParseJWT("secret", algToken); err == nil {
+		t.Fatal("非 HS256 算法不应通过")
+	}
+
+	// exp 是必需声明，不能接受没有过期时间的长期令牌。
+	noExpPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1"}`))
+	noExpInput := parts[0] + "." + noExpPayload
+	noExpMAC := hmac.New(sha256.New, []byte("secret"))
+	noExpMAC.Write([]byte(noExpInput))
+	noExpToken := noExpInput + "." + base64.RawURLEncoding.EncodeToString(noExpMAC.Sum(nil))
+	if _, err := crypto.ParseJWT("secret", noExpToken); err == nil {
+		t.Fatal("缺少 exp 的令牌不应通过")
 	}
 }
 
