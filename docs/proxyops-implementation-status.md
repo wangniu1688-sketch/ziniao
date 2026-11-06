@@ -13,7 +13,8 @@ This document records repository evidence, not estimated completion percentages.
 - `POST /api/v1/proxies`: create proxy.
 - `PUT /api/v1/proxies/{id}`: update proxy; password has keep/clear/replace semantics.
 - `DELETE /api/v1/proxies/{id}`: delete only when no environment references it.
-- `POST /api/v1/proxies/{id}/test`: perform a live probe and return a result.
+- `POST /api/v1/proxies/{id}/test`: perform a live probe, return the result and append an immutable history row.
+- `GET /api/v1/proxies/{id}/history?limit=100`: return the latest tenant-scoped probe records (maximum 100), newest first.
 
 ### Persistence and credential handling
 - Migration `0012_launcher_core.up.sql` creates the tenant-scoped `proxies` table with protocol, port and status constraints plus RLS.
@@ -31,11 +32,10 @@ This document records repository evidence, not estimated completion percentages.
 
 ## Gaps to close before calling the MVP complete
 
-1. **Immutable probe history:** current schema stores only the latest result on `proxies`. Add a tenant-scoped probe-history table and repository methods; preserve recent 100 records per proxy in the API.
-2. **Trend and reliability metrics:** calculate success rate and latency from persisted history, not from the latest status alone.
-3. **Anomaly state and in-app alerts:** support configurable latency threshold and consecutive-failure threshold; avoid duplicate alert spam and clear/recover alerts when the proxy recovers.
-4. **Windows desktop acceptance:** verify the Tauri Windows build launches the intended UI, persists API configuration safely, and can complete create/edit/disable/test/history flows against the local service.
-5. **Release acceptance:** run Go tests/vet and Windows build on CI or a Windows runner, then publish a clearly versioned first trial package with setup and rollback instructions.
+1. **Trend and reliability metrics:** calculate success rate and latency from persisted history, not from the latest status alone.
+2. **Anomaly state and in-app alerts:** support configurable latency threshold and consecutive-failure threshold; avoid duplicate alert spam and clear/recover alerts when the proxy recovers.
+3. **Windows desktop acceptance:** verify the Tauri Windows build launches the intended UI, persists API configuration safely, and can complete create/edit/disable/test/history flows against the local service.
+4. **Release acceptance:** verify Go tests/vet and Windows build on CI or a Windows runner, then publish a clearly versioned first trial package with setup and rollback instructions.
 
 ## Execution order
 
