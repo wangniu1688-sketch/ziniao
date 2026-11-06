@@ -232,6 +232,71 @@ func (r proxyRepo) SaveCheckResult(ctx context.Context, id string, c store.Proxy
 	}))
 }
 
+// AppendProbeHistory 只追加拨测事实，不保存目标 URL 或任何代理凭据。
+func (r proxyRepo) AppendProbeHistory(ctx context.Context, h *types.ProxyProbeHistory) error {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return err
+	}
+	if h == nil || h.ID == "" || h.ProxyID == "" {
+		return apierr.Validation("拨测历史缺少必要标识")
+	}
+	if !types.ValidProxyCheckStatus(h.CheckStatus) || h.CheckStatus == types.ProxyCheckUnknown {
+		return apierr.Validation("拨测历史状态无效")
+	}
+	if h.LatencyMS < 0 || h.StatusCode < 0 || h.StatusCode > 599 {
+		return apierr.Validation("拨测历史数值无效")
+	}
+	if h.CheckedAt.IsZero() {
+		h.CheckedAt = time.Now().UTC()
+	}
+	if len([]rune(h.Error)) > 200 {
+		h.Error = string([]rune(h.Error)[:200])
+	}
+	h.TenantID = tid
+	return wrapErr(r.run(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, `INSERT INTO proxy_probe_history
+			(id,tenant_id,proxy_id,check_status,status_code,latency_ms,error_message,checked_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+			h.ID, tid, h.ProxyID, h.CheckStatus, h.StatusCode, h.LatencyMS,
+			nullStr(h.Error), h.CheckedAt)
+		return err
+	}))
+}
+
+// ListProbeHistory 返回最近记录；SQL 中显式 tenant_id + proxy_id 双重过滤。
+func (r proxyRepo) ListProbeHistory(ctx context.Context, proxyID string, limit int) ([]types.ProxyProbeHistory, error) {
+	tid, err := r.tenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	out := []types.ProxyProbeHistory{}
+	err = r.run(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT id,tenant_id,proxy_id,check_status,status_code,
+			latency_ms,COALESCE(error_message,''),checked_at
+			FROM proxy_probe_history
+			WHERE tenant_id=$1 AND proxy_id=$2
+			ORDER BY checked_at DESC,id DESC LIMIT $3`, tid, proxyID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var h types.ProxyProbeHistory
+			if err := rows.Scan(&h.ID,&h.TenantID,&h.ProxyID,&h.CheckStatus,&h.StatusCode,
+				&h.LatencyMS,&h.Error,&h.CheckedAt); err != nil {
+				return err
+			}
+			out = append(out,h)
+		}
+		return rows.Err()
+	})
+	return out, wrapErr(err)
+}
+
 // proxyTypeOr / proxyCheckOr 枚举兜底（DB 有 CHECK，mem 没有，Go 侧必须再判一次）。
 //
 // 空串走到这里只有一种来源：历史行（0013 之前建的）或 mem 驱动里手工塞的零值。
