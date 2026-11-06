@@ -8,6 +8,7 @@ import (
 
 	"ziniao/platform/store"
 	"ziniao/platform/types"
+	"ziniao/shop"
 )
 
 func TestProxyProbeHistoryIsTenantScopedAndLimitedTo100(t *testing.T) {
@@ -50,6 +51,28 @@ func TestProxyProbeHistoryIsTenantScopedAndLimitedTo100(t *testing.T) {
 	}
 	if len(foreign) != 0 {
 		t.Fatalf("history leaked across tenants: %+v", foreign)
+	}
+}
+
+
+func TestProxyHistoryServiceReturnsLiveProbeRecord(t *testing.T) {
+	s := newProbeSuite(t)
+	proxyID := s.seedProxy(t, "历史落库", tunnelProxy(t), "", "US")
+	res, err := s.proxies.Test(context.Background(), shop.ProxyTestInput{
+		ProxyID: proxyID, Target: ipEchoTarget(t), TimeoutMS: 3000, Actor: s.actor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK || res.StatusCode != 200 {
+		t.Fatalf("expected successful HTTP 200 probe, got %+v", res)
+	}
+	history, err := s.proxies.History(context.Background(), s.actor, proxyID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].CheckStatus != types.ProxyCheckOK || history[0].StatusCode != 200 {
+		t.Fatalf("unexpected history result: %+v", history)
 	}
 }
 
