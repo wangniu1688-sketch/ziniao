@@ -313,6 +313,8 @@ func (r envRepo) Create(ctx context.Context, e *types.Environment) error {
 	if err != nil {
 		return err
 	}
+	// Persist the exact timestamp returned through the caller's object.
+	e.UpdatedAt = time.Now().UTC()
 	return wrapErr(r.run(ctx, func(q querier) error {
 		snapshot, err := json.Marshal(e.Snapshot)
 		if err != nil {
@@ -425,7 +427,7 @@ func (r envRepo) Update(ctx context.Context, e *types.Environment) error {
 		// running 上。现在由 execStmt 兜住：再漏就当场报出哪句 SQL 少几个参数。
 		_, err = execStmt(ctx, q, envUpdateSQL,
 			e.ID, tid, nullStr(e.ShopID), nullStr(e.DeviceID), e.ProfileID, e.BaselineHash,
-			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, time.Now(),
+			e.KernelMajor, nullStr(e.TLSHelloID), e.Status, snapshot, consistency, e.UpdatedAt,
 			nullStr(e.ProxyID), nullStr(e.Country), nullStr(e.StartURL),
 			nullTime(e.LastStartedAt), nullStr(e.ThumbnailPath), nullStr(e.InjectScript))
 		return err
