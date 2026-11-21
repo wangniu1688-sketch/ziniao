@@ -313,8 +313,6 @@ func (r envRepo) Create(ctx context.Context, e *types.Environment) error {
 	if err != nil {
 		return err
 	}
-	// Persist the exact timestamp returned through the caller's object.
-	e.UpdatedAt = time.Now().UTC()
 	return wrapErr(r.run(ctx, func(q querier) error {
 		snapshot, err := json.Marshal(e.Snapshot)
 		if err != nil {
@@ -410,6 +408,8 @@ func (r envRepo) Update(ctx context.Context, e *types.Environment) error {
 	if err != nil {
 		return err
 	}
+	// Persist the same timestamp on the returned model and in PostgreSQL.
+	e.UpdatedAt = time.Now().UTC()
 	return wrapErr(r.run(ctx, func(q querier) error {
 		snapshot, err := json.Marshal(e.Snapshot)
 		if err != nil {
