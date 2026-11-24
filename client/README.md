@@ -1,58 +1,61 @@
-# 客户端骨架（Tauri 2 + Rust）
+# 紫鸟 Windows 客户端（Tauri 2）
 
-> ⚠️ **状态：骨架，未编译验证**。本机（Windows）未安装 Rust / Node 工具链，
-> 因此本目录只交付「目录结构 + 关键实现思路 + 可直接落地的注入脚本」，
-> 不含构建产物。安装 Rust 后按文末命令即可构建。
+当前客户端不是已验收的正式产品，但仓库已有 Tauri 2 / Rust 桌面外壳、店铺与环境管理界面、环境窗口生命周期处理，以及 Go 代理 sidecar 的启动入口。**是否能在干净 Windows 环境安装并完成真实代理链路，必须以 Windows 构建和端到端验收结果为准。**
 
-## 职责边界（必须与服务端对齐）
+## 首版交付范围
 
-| 能力 | 服务端（Go） | 客户端（Rust/JS） |
-|---|---|---|
-| 画像采样与自洽性体检 | ✅ `fingerprint` 包 | 只接收结果 |
-| 注入脚本生成 | ✅ `fingerprint.BuildInjectionPlan` | 在文档创建前执行 |
-| TLS 指纹 | ✅ uTLS 前置代理（`network.TLSProxy`） | 进程内启动 / 旁挂 sidecar |
-| 代理出口与纯净度 | ✅ `network` 包 | 上报观测值 |
-| 环境自检 | ✅ `shop.EnvService.Check` | 采集 `navigator` 观测值上报 |
-| 离线启动校验 | ✅ 基线哈希比对（L8） | 启动前上报 `baseline_hash` |
-| 凭证明文 | ✅ 信封加密，按需下发 | **绝不落盘** |
-| 权限三层 | ✅ 服务端裁决 | 第三层 DOM 注入按 `/api/v1/iam/dom-policy` 执行 |
+- 登录并连接 Go 服务端。
+- 加载店铺及环境列表。
+- 创建、启动、关闭、启用、停用和删除环境。
+- 为每个环境使用独立 WebView2 profile。
+- 启动环境时尝试拉起同环境代理配置的 `ziniao-proxy.exe`。
+- 展示服务端返回的环境状态及站内通知。
 
-铁律：**客户端是执行器，不是决策器**。任何"客户端自己判断能不能做"的实现都是安全漏洞（L3/L6）。
+首版暂不以 Chromium 内核深度定制、复杂趋势报表和高级指纹能力作为发布门槛。任何代理链路未真实验证的能力，不得在产品页面宣称已可用。
 
-## 目录
+## Windows 构建
 
-```
-client/
-├── index.html                 # 最小界面：登录 → 环境列表 → 启动
-├── src/main.js                # 前端逻辑（调用云端 API）
-├── inject/fingerprint.js      # 注入脚本（在文档创建前执行，服务端下发为准）
-└── src-tauri/
-    ├── Cargo.toml
-    ├── tauri.conf.json
-    └── src/main.rs            # Rust 外壳：拉注入计划、管本地代理、上报自检
-```
+GitHub Actions 已增加 Windows 安装包构建工作流：
 
-## 关键实现点
+- 工作流：`.github/workflows/windows-client.yml`
+- 触发：推送或 PR 修改客户端、代理 sidecar 或构建工作流；也支持手动触发。
+- 构建步骤：Windows runner → Go 编译 `cmd/ziniao-proxy` → `npm ci` → 前端静态资源构建 → Tauri NSIS 安装包。
+- 成功产物：Actions Artifact `ziniao-windows-nsis`（保留 14 天）。
 
-### 1. 注入时机（决定指纹能不能被绕过）
-`inject/fingerprint.js` 必须在**文档创建前**通过 `Page.addScriptToEvaluateOnNewDocument`（CDP）
-或 Tauri 的 `initialization_script` 执行，否则 `navigator.userAgent` 已被页面读取，
-后出现"到底该信哪个"的自相矛盾（对标文档 M0.1）。
+查看 [Windows Client Build 工作流](../actions/workflows/windows-client.yml)。
 
-### 2. 代理与指纹同源（L2 / 致命项）
-Rust 侧只负责启动本地前置代理（`ziniao-proxy` sidecar，Go 编译），
-**不自己构造 TLS**——保证"浏览器声称的内核版本" 与 "实际 TLS 指纹" 出自同一份基线，
-避免 TLS 与声称版本脱钩。
+本机手动构建需要 Windows C++ Build Tools、Rust MSVC 工具链、Node.js 22、Go。构建前先生成 sidecar：
 
-### 3. 自检数据回传
-启动环境后采集 `navigator.*`（UA / platform / 时区 / 语言 / 屏幕 / WebGL / Canvas / Audio 噪声）
-作为 `observed` 上报 `POST /api/v1/shops/{id}/environment/check`，
-服务端计算自洽性、漂移与基线校验，返回体检报告。
-
-## 构建（需先安装 Rust 1.77+ / Node 18+）
-
-```bash
+```powershell
+New-Item -ItemType Directory -Force client/src-tauri/sidecar
+go build -trimpath -o client/src-tauri/sidecar/ziniao-proxy.exe ./cmd/ziniao-proxy
 cd client
-npm install
+npm ci
+npm run build
 npm run tauri build
 ```
+
+安装包默认输出到 `client/src-tauri/target/release/bundle/nsis/`。
+
+## 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `client/index.html` | 登录、店铺/环境列表、通知中心 |
+| `client/src-tauri/src/lib.rs` | Tauri 命令注册、应用入口 |
+| `client/src-tauri/src/env_window.rs` | 环境窗口、profile、代理 sidecar 与生命周期 |
+| `client/src-tauri/tauri.conf.json` | 桌面窗口、CSP、NSIS 与 sidecar 资源配置 |
+| `cmd/ziniao-proxy/main.go` | 本地代理 sidecar 入口 |
+| `client/scripts/build-static.mjs` | 生成 Tauri 前端静态目录 |
+
+## 发布前必须通过的 Windows 验收
+
+1. Windows 10/11 干净环境安装、启动、卸载；确认 WebView2 依赖提示清晰。
+2. 登录真实测试服务端，验证错误密码、服务端不可达、会话过期时的提示。
+3. 创建环境并启动两个不同店铺，确认窗口与 profile 隔离。
+4. 确认安装包内 sidecar 确实存在并可启动；分别用真实 HTTP、HTTPS、SOCKS5 上游代理验证出口 IP。
+5. 关闭窗口后确认代理子进程退出、服务端环境状态回到 idle。
+6. 验证通知加载、刷新环境、删除环境及本机 profile 清理。
+7. 不使用仓库内演示账号作为正式默认凭据；测试账号和服务地址必须由部署环境提供。
+
+**注意：** CI 构建成功只证明 Windows 安装包能编译出来，不等于上述运行验收已通过，更不等于已可向卖家正式收费。

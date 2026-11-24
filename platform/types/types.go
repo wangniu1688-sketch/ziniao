@@ -314,6 +314,18 @@ type Proxy struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
+// ProxyProbeHistory 一次代理拨测的不可变历史记录。口令、密文和目标 URL 均不入历史。
+type ProxyProbeHistory struct {
+	ID         string    `json:"id"`
+	TenantID   string    `json:"tenant_id"`
+	ProxyID    string    `json:"proxy_id"`
+	CheckStatus string   `json:"check_status"`
+	StatusCode int       `json:"status_code,omitempty"`
+	LatencyMS  int       `json:"latency_ms"`
+	Error      string    `json:"error,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
 // 代理类型 / 拨测健康的枚举（DB 有 CHECK，mem 驱动没有，Go 侧必须再判一次）。
 const (
 	ProxyTypeISP               = "isp"

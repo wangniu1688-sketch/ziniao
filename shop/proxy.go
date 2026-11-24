@@ -400,6 +400,24 @@ func (s *ProxyService) Get(ctx context.Context, actor iam.Subject, id string) (*
 }
 
 // List 代理台账（分页 + 状态/关键词过滤），每项带 bound_env_count。
+// History 查询单条代理最近 100 次拨测记录。
+func (s *ProxyService) History(ctx context.Context, actor iam.Subject, proxyID string, limit int) ([]types.ProxyProbeHistory, error) {
+	d := s.engine.Check(ctx, iam.Request{Subject: actor, Action: "proxy:read", Path: "/proxies"})
+	if !d.Allow {
+		return nil, apierr.Forbidden("无权查看代理拨测历史（" + string(d.Layer) + "）")
+	}
+	tctx := store.WithTenant(ctx, actor.TenantID)
+	// 先确认代理归属，避免跨租户 ID 被当成空历史成功返回。
+	if _, err := s.st.Proxies().Get(tctx, proxyID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	return s.st.Proxies().ListProbeHistory(tctx, proxyID, limit)
+}
+
+// List 代理台账（分页 + 状态/关键词过滤），每项带 bound_env_count。
 func (s *ProxyService) List(ctx context.Context, actor iam.Subject, f store.ProxyFilter) ([]ProxyView, int, error) {
 	d := s.engine.Check(ctx, iam.Request{Subject: actor, Action: "proxy:read", Path: "/proxies"})
 	if !d.Allow {
@@ -476,6 +494,7 @@ type ProxyTestInput struct {
 type ProxyTestResult struct {
 	OK          bool   `json:"ok"`
 	ElapsedMS   int64  `json:"elapsed_ms"`
+	StatusCode  int    `json:"status_code,omitempty"`
 	ExitIP      string `json:"exit_ip,omitempty"`
 	ExitCountry string `json:"exit_country,omitempty"`
 	// CountryMeasured ExitCountry 是不是真测出来的。
@@ -622,6 +641,7 @@ func probeProxy(ctx context.Context, st store.Store, cipher *crypto.EnvelopeCiph
 	}()
 	// 4xx 不是连通成功：403/407 恰恰说明代理鉴权或目标拒绝，
 	// 旧口径 StatusCode < 500 会把它们显示成「拨测成功」。
+	out.StatusCode = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		out.Error = "目标返回 HTTP " + itoa(resp.StatusCode)
 		return out
@@ -697,16 +717,26 @@ func persistProxyCheck(ctx context.Context, st store.Store, log *slog.Logger, id
 	if res.OK {
 		status = types.ProxyCheckOK
 	}
+	checkedAt := time.Now().UTC()
 	err := st.Proxies().SaveCheckResult(ctx, id, store.ProxyCheckResult{
 		CheckStatus: status,
+		StatusCode:  res.StatusCode,
 		ExitIP:      res.ExitIP,
 		ExitCountry: res.ExitCountry,
 		LatencyMS:   int(res.ElapsedMS),
-		CheckedAt:   time.Now().UTC(),
+		CheckedAt:   checkedAt,
 		LastError:   res.Error,
 	})
 	if err != nil && log != nil {
 		log.Warn("拨测结论落库失败（不影响本次结论）", "proxy", id, "err", err.Error())
+	}
+	// 历史记录只保存结果摘要，不保存目标 URL、代理地址凭据或密文。
+	history := &types.ProxyProbeHistory{
+		ID: ids.New(), ProxyID: id, CheckStatus: status, StatusCode: res.StatusCode,
+		LatencyMS: int(res.ElapsedMS), Error: res.Error, CheckedAt: checkedAt,
+	}
+	if err := st.Proxies().AppendProbeHistory(ctx, history); err != nil && log != nil {
+		log.Warn("拨测历史写入失败（不影响本次结论）", "proxy", id, "err", err.Error())
 	}
 }
 

@@ -67,8 +67,9 @@ type Store struct {
 	consumed map[string]bool
 
 	// M1 启动器内核（0012）：手工静态代理台账 + 店铺分组
-	proxies map[string]*types.Proxy
-	groups  map[string]*types.Group
+	proxies    map[string]*types.Proxy
+	probeHistory []*types.ProxyProbeHistory
+	groups     map[string]*types.Group
 }
 
 // New 创建空存储。

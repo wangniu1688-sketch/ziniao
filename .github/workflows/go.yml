@@ -2,7 +2,7 @@ name: Go CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, product/proxyops-mvp]
   pull_request:
     branches: [main]
 

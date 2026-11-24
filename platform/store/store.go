@@ -381,6 +381,7 @@ type ProxyFilter struct {
 // 启动链路上的高频动作，绝不能让它有机会碰到凭据列。
 type ProxyCheckResult struct {
 	CheckStatus string    // ok|fail|unknown
+	StatusCode  int       // HTTP 响应状态码；无响应时为 0
 	ExitIP      string    // 实测出口 IP；拿不到留空（不猜）
 	ExitCountry string    // 实测国家；未配置国家探测目标时沿用台账 country
 	LatencyMS   int       // 拨测耗时
@@ -412,6 +413,10 @@ type ProxyRepo interface {
 	// 只 UPDATE 拨测相关的 6 列，**永不触碰 password_enc**：拨测在启动链路上
 	// 会被反复调用，一旦它走整行写回，手里那份空密文就会把真实口令清掉。
 	SaveCheckResult(ctx context.Context, id string, r ProxyCheckResult) error
+	// AppendProbeHistory 追加一次不可变拨测历史；调用方必须提供已裁剪的错误摘要。
+	AppendProbeHistory(ctx context.Context, h *types.ProxyProbeHistory) error
+	// ListProbeHistory 返回该代理最近的拨测历史，limit 最大 100；租户从 ctx 获取。
+	ListProbeHistory(ctx context.Context, proxyID string, limit int) ([]types.ProxyProbeHistory, error)
 	// PasswordEnc 取该代理的口令密文。
 	//
 	// 刻意独立成方法、且**不在** List/Get 的列里（proxyColumns 显式排除 password_enc）：

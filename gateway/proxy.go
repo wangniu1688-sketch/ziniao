@@ -18,6 +18,7 @@ func (s *Server) routesProxies() {
 	m.HandleFunc("PUT /api/v1/proxies/{id}", s.authed(s.handleProxyUpdate))
 	m.HandleFunc("DELETE /api/v1/proxies/{id}", s.authed(s.handleProxyDelete))
 	m.HandleFunc("POST /api/v1/proxies/{id}/test", s.authed(s.handleProxyTest))
+	m.HandleFunc("GET /api/v1/proxies/{id}/history", s.authed(s.handleProxyHistory))
 }
 
 // ---------- GET /api/v1/proxies ----------
@@ -236,4 +237,30 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+
+// ---------- GET /api/v1/proxies/{id}/history ----------
+
+// handleProxyHistory 返回指定代理最近 100 次拨测历史；历史查询与代理台账同租户权限。
+func (s *Server) handleProxyHistory(w http.ResponseWriter, r *http.Request) {
+	p, subj, _, err := s.authorize(r, "proxy:read", "/proxies")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.deps.Proxies == nil {
+		s.notWired(w)
+		return
+	}
+	limit := queryInt(r, "limit", 100)
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	items, err := s.deps.Proxies.History(r.Context(), p2subject(p, subj), r.PathValue("id"), limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
 }

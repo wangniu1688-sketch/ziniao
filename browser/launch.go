@@ -519,30 +519,42 @@ func (m *Manager) captureThumbnail(ctx context.Context, sess *Session) string {
 func (m *Manager) watchProcess(sess *Session) {
 	<-sess.proc.Done()
 	envID := sess.Entry.EnvID
-	m.log.Warn("浏览器进程已退出，自动复位状态", "env", envID, "pid", sess.Entry.PID)
-	// 进程已不在：它留下的端口文件与单实例锁现在是垃圾，留着会让下次启动读到旧端口。
-	m.clearProfileResidue(sess.Entry.ProfileDir, "浏览器进程退出后")
-	sess.cancel()
-	if sess.conn != nil {
-		_ = sess.conn.Close()
-	}
-	if sess.proxy != nil {
-		_ = sess.proxy.Close()
-	}
-	m.untrack(envID)
-	if uerr := m.Unregister(envID); uerr != nil {
-		m.log.Warn("崩溃复位：运行时注销失败", "env", envID, "err", uerr.Error())
-	}
-	if m.envs == nil {
-		return
-	}
-	ctx, cancel := dbContext(context.Background())
-	defer cancel()
-	if _, err := m.envs.StopEnv(ctx, shop.StopInput{
-		ShopID: sess.shopID, Actor: sess.actor, Terminal: sess.terminal, URL: sess.url,
-	}); err != nil {
-		m.log.Error("崩溃复位：业务状态收回失败（可能滞留 running）", "env", envID, "err", err.Error())
-	}
+
+	// 与显式 Stop 共用同一把环境锁。否则 Stop 触发 Terminate 后，
+	// watcher 和 Stop 会同时清理 profile、注销注册表；并发 Flush 可能在
+	// 临时文件上打架，甚至在 Stop 返回后继续写入已清理的数据目录。
+	_ = m.WithEnvLock(envID, func() error {
+		// Stop 可能先一步完成并摘掉会话；此时 watcher 只需退出，不能重复清理。
+		if m.session(envID) != sess {
+			return nil
+		}
+
+		m.log.Warn("浏览器进程已退出，自动复位状态", "env", envID, "pid", sess.Entry.PID)
+		// 进程已不在：它留下的端口文件与单实例锁现在是垃圾，留着会让下次启动读到旧端口。
+		m.clearProfileResidue(sess.Entry.ProfileDir, "浏览器进程退出后")
+		sess.cancel()
+		if sess.conn != nil {
+			_ = sess.conn.Close()
+		}
+		if sess.proxy != nil {
+			_ = sess.proxy.Close()
+		}
+		m.untrack(envID)
+		if uerr := m.Unregister(envID); uerr != nil {
+			m.log.Warn("崩溃复位：运行时注销失败", "env", envID, "err", uerr.Error())
+		}
+		if m.envs == nil {
+			return nil
+		}
+		ctx, cancel := dbContext(context.Background())
+		defer cancel()
+		if _, err := m.envs.StopEnv(ctx, shop.StopInput{
+			ShopID: sess.shopID, Actor: sess.actor, Terminal: sess.terminal, URL: sess.url,
+		}); err != nil {
+			m.log.Error("崩溃复位：业务状态收回失败（可能滞留 running）", "env", envID, "err", err.Error())
+		}
+		return nil
+	})
 }
 
 // ---------- 会话表 ----------

@@ -196,6 +196,62 @@ func (r proxyRepo) SaveCheckResult(ctx context.Context, id string, c store.Proxy
 	return nil
 }
 
+// AppendProbeHistory 只追加拨测事实，内存驱动与 PostgreSQL 保持相同租户语义。
+func (r proxyRepo) AppendProbeHistory(ctx context.Context, h *types.ProxyProbeHistory) error {
+	tid, err := store.TenantFrom(ctx)
+	if err != nil {
+		return err
+	}
+	if h == nil || h.ID == "" || h.ProxyID == "" {
+		return notFound("proxy", "")
+	}
+	p, ok := r.s.proxies[h.ProxyID]
+	if !ok || p.TenantID != tid {
+		return notFound("proxy", h.ProxyID)
+	}
+	if !types.ValidProxyCheckStatus(h.CheckStatus) || h.CheckStatus == types.ProxyCheckUnknown ||
+		h.LatencyMS < 0 || h.StatusCode < 0 || h.StatusCode > 599 {
+		return notFound("proxy_probe_history", h.ID)
+	}
+	cp := *h
+	cp.TenantID = tid
+	if cp.CheckedAt.IsZero() {
+		cp.CheckedAt = time.Now().UTC()
+	}
+	if len([]rune(cp.Error)) > 200 {
+		cp.Error = string([]rune(cp.Error)[:200])
+	}
+	r.s.probeHistory = append(r.s.probeHistory, &cp)
+	return nil
+}
+
+// ListProbeHistory 返回该租户该代理最近的历史记录，最多 100 条。
+func (r proxyRepo) ListProbeHistory(ctx context.Context, proxyID string, limit int) ([]types.ProxyProbeHistory, error) {
+	tid, err := store.TenantFrom(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	out := []types.ProxyProbeHistory{}
+	for _, h := range r.s.probeHistory {
+		if h.TenantID == tid && h.ProxyID == proxyID {
+			out = append(out, *h)
+		}
+	}
+	sort.Slice(out, func(i,j int) bool {
+		if out[i].CheckedAt.Equal(out[j].CheckedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CheckedAt.After(out[j].CheckedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // PasswordEnc 取口令密文（唯一读密文的入口，见接口注释）。
 func (r proxyRepo) PasswordEnc(ctx context.Context, id string) (string, error) {
 	tid, err := store.TenantFrom(ctx)

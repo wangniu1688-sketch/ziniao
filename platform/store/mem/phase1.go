@@ -320,9 +320,12 @@ func (r envRepo) Update(ctx context.Context, e *types.Environment) error {
 	if !ok || old.TenantID != tid {
 		return notFound("environment", e.ID)
 	}
+	// Keep the caller's value and the persisted value identical. Services return
+	// the same object after Update, so independently refreshing only the stored
+	// copy makes the response disagree with a subsequent read.
+	e.UpdatedAt = time.Now().UTC()
 	cp := *e
 	cp.TenantID = tid
-	cp.UpdatedAt = time.Now()
 	r.s.envs[e.ID] = &cp
 	return nil
 }
